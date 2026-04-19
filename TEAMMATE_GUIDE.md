@@ -204,27 +204,34 @@ curl.exe http://127.0.0.1:8888/health
 
 ### 如果 `env_file_loaded: false` 或 `llm_api_key_set: false`
 
-说明 `.env` 没生效。按这个顺序排查（**不要**听别的 AI 让你加 `--env-file`，uvicorn 根本没这个参数）：
+`.env` 没生效。代码会在**两个位置**查找 `.env`（按顺序）：
+
+1. **代码根目录**（`orchestrator/` 的父目录，由 `Path(__file__).resolve().parent.parent` 算出）
+2. **启动命令的 cwd**（你在哪个目录敲 `python -m uvicorn`）
+
+只要其中一个存在就能加载。如果两个都不在，按这个顺序排查：
 
 **① 确认文件名和位置**
 
 ```powershell
-# 必须在项目根目录（和 orchestrator/ 同级）
+# 看当前目录有没有 .env
+ls .env
+# 或者看 repo 根目录
 ls D:\MoDora-orchestrator\.env
 ```
 
 - 文件名必须是 `.env`，不是 `.env.example`、不是 `.env.txt`
-- 位置必须在 **repo 根目录**，不是 `orchestrator\` 子目录下
 - Windows 资源管理器默认隐藏以点开头的文件 → 建议用 `ls` 或 VS Code 确认
+- **从 GitHub ZIP 解压的常见坑**：`MoDora-orchestrator-main\MoDora-orchestrator-main\` 双层嵌套，`.env` 要放在**内层**（和 `orchestrator/` 同级）
 
 **② 确认文件编码**
 
 Windows 记事本保存会加 UTF-8 BOM，`python-dotenv` 可能解析失败：
 ```powershell
 # 用 VS Code 打开 .env → 右下角确认是 "UTF-8"（不是 "UTF-8 with BOM"）
-# 或命令行查：
+# 或命令行查前三个字节：
 Get-Content D:\MoDora-orchestrator\.env -Encoding Byte -TotalCount 3
-# 如果前三个字节是 239 187 191 → 有 BOM，需要重新用 UTF-8（无 BOM）保存
+# 如果返回 239 187 191 → 有 BOM，需要重新用 UTF-8（无 BOM）保存
 ```
 
 **③ 确认内容格式**
@@ -237,21 +244,30 @@ Get-Content D:\MoDora-orchestrator\.env -Encoding Byte -TotalCount 3
 
 **④ 看 orchestrator 启动日志的第一行**
 
-启动窗口（窗口 3）应该有这行：
+启动窗口应该有这行：
 ```
 orchestrator - .env loaded=True path=...\.env  LLM_API_KEY=sk-xxx…abcd  LLM_MODEL=qwen-plus
 ```
-如果 `loaded=False`，说明文件路径不对。
+如果 `loaded=False`，说明两个候选路径都没找到 `.env`。
 
-**⑤ 兜底方案：直接设进程环境变量**
+**⑤ 兜底方案 A：uvicorn 原生 `--env-file`**
 
-如果以上都不行（比如 `.env` 里有奇怪字符），可以在启动 orchestrator 的那个窗口里**先**设置变量，再启动：
+uvicorn 支持 `--env-file` 参数（路径相对于 uvicorn 启动时的 cwd）：
+```powershell
+python -m uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload --env-file .env
+```
+只要你敲命令时 cwd 里有 `.env` 就能加载。**这也是最不容易踩坑的方式，推荐**。
+
+**⑥ 兜底方案 B：直接设进程环境变量**
+
+如果 `.env` 里有奇怪字符实在解析不了，干脆不用 `.env`，在启动 orchestrator 的那个窗口里**先**设变量，再启动：
 ```powershell
 $env:LLM_API_KEY = "sk-你的真实key"
 $env:LLM_MODEL   = "qwen-plus"
 python -m uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload
 ```
-这样绕开了 `.env` 文件，直接用进程环境变量，`curl /health` 应该立刻看到 `llm_api_key_set: true`。
+
+两种兜底任选一个都行，`curl /health` 看到 `llm_api_key_set: true` 就对了。
 
 ---
 

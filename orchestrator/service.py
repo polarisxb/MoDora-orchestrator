@@ -49,15 +49,28 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# Load .env at the repository root before reading env-driven config anywhere.
+# Load .env before reading any env-driven config.
+# We check multiple locations so the common Windows failure mode
+# (ZIP-extracted nested "repo-main\repo-main\" layouts, or users putting
+# .env next to their shell cwd instead of the code root) can't cause a
+# silent "no LLM_API_KEY" crash.
 from dotenv import load_dotenv
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ENV_FILE = _REPO_ROOT / ".env"
+_ENV_CANDIDATES = [
+    _REPO_ROOT / ".env",          # canonical: sibling of orchestrator/
+    Path.cwd() / ".env",          # fallback: wherever uvicorn was launched
+]
+_ENV_FILE: Optional[Path] = None
 _ENV_LOADED = False
-if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE, override=False)
-    _ENV_LOADED = True
+for _cand in _ENV_CANDIDATES:
+    if _cand.exists():
+        load_dotenv(_cand, override=False)
+        _ENV_FILE = _cand
+        _ENV_LOADED = True
+        break
+if _ENV_FILE is None:
+    _ENV_FILE = _REPO_ROOT / ".env"  # for error messages
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware

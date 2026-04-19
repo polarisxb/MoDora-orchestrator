@@ -45,11 +45,13 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 # Load .env so DashScope credentials flow into this process too.
+# Same dual-path fallback as service.py: try repo root first, then cwd.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ENV_FILE = _REPO_ROOT / ".env"
-if _ENV_FILE.exists():
-    from dotenv import load_dotenv
-    load_dotenv(_ENV_FILE)
+for _cand in (_REPO_ROOT / ".env", Path.cwd() / ".env"):
+    if _cand.exists():
+        from dotenv import load_dotenv
+        load_dotenv(_cand, override=False)
+        break
 
 from orchestrator import llm  # noqa: E402  (after load_dotenv)
 
