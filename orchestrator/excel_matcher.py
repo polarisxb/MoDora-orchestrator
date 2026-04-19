@@ -66,6 +66,105 @@ def _norm(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Date helpers (for range filters)
+# ---------------------------------------------------------------------------
+
+_DATE_RE = re.compile(
+    r"(\d{4})[\-/年.](\d{1,2})[\-/月.](\d{1,2})"
+)
+
+
+def _parse_date(value: Any) -> Optional[str]:
+    """Try to extract a YYYY-MM-DD string from *value*.
+
+    Returns ``None`` if no recognisable date pattern is found.
+    """
+    if value is None:
+        return None
+    m = _DATE_RE.search(str(value))
+    if not m:
+        return None
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+# ---------------------------------------------------------------------------
+# Row-level filtering (P1)
+# ---------------------------------------------------------------------------
+
+def apply_row_filters(
+    sheets: List[SheetIndex],
+    filters: List[Dict[str, str]],
+) -> List[SheetIndex]:
+    """Return copies of *sheets* with rows narrowed by *filters*.
+
+    Each filter dict has one of two forms:
+
+    - ``{"column": "城市", "value": "德州市"}`` — substring / exact match
+      (normalised, case-insensitive).
+    - ``{"column": "日期", "start": "2020-07-01", "end": "2020-08-31"}``
+      — inclusive date-range comparison on the raw cell text.
+
+    Filters are ANDed: a row must pass **every** filter to survive.
+    If *filters* is empty the original sheets are returned unchanged.
+    """
+    if not filters:
+        return sheets
+
+    out: List[SheetIndex] = []
+    for sheet in sheets:
+        # Resolve filter column indices within this sheet.
+        resolved: List[tuple] = []
+        for f in filters:
+            col_name = f.get("column", "")
+            col_idx = _find_column(sheet, col_name)
+            if col_idx is None:
+                # This sheet doesn't have the filter column — skip filter
+                # (the sheet might still be useful for other columns).
+                continue
+            if "value" in f:
+                resolved.append(("eq", col_idx, _norm(f["value"])))
+            elif "start" in f or "end" in f:
+                resolved.append(("range", col_idx, f.get("start", ""), f.get("end", "9999-12-31")))
+        if not resolved:
+            # None of the filters apply to this sheet → keep all rows.
+            out.append(sheet)
+            continue
+
+        kept: List[List[str]] = []
+        for row in sheet.rows:
+            ok = True
+            for kind, cidx, *args in resolved:
+                cell = row[cidx] if cidx < len(row) else ""
+                if kind == "eq":
+                    if args[0] not in _norm(cell):
+                        ok = False
+                        break
+                elif kind == "range":
+                    d = _parse_date(cell)
+                    if d is None:
+                        ok = False
+                        break
+                    if d < args[0] or d > args[1]:
+                        ok = False
+                        break
+            if ok:
+                kept.append(row)
+        logger.info(
+            "apply_row_filters: sheet %s:%s  %d -> %d rows",
+            sheet.source_path, sheet.sheet_name,
+            len(sheet.rows), len(kept),
+        )
+        out.append(SheetIndex(
+            source_path=sheet.source_path,
+            sheet_name=sheet.sheet_name,
+            raw_headers=sheet.raw_headers,
+            headers=sheet.headers,
+            rows=kept,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
 
@@ -82,7 +181,7 @@ def build_index(excel_paths: List[str]) -> List[SheetIndex]:
     out: List[SheetIndex] = []
     for path in excel_paths:
         try:
-            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
         except Exception:
             logger.exception("excel_matcher: failed to open %s", path)
             continue

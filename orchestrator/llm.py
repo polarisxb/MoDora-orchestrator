@@ -306,3 +306,41 @@ def render_question(
         parent_clause = "、".join(f"{k}为{v}" for k, v in parent_values.items() if v)
         return f"{parent_clause} 的 {child_header} 是多少?"
     return f"{child_header} 是多少?"
+
+
+def build_excel_filter_prompt(
+    context: str,
+    requirement: str,
+    available_headers: List[str],
+) -> str:
+    """Ask the LLM to extract column-level row filters from context + requirement.
+
+    The reply contract is a JSON array of filter objects::
+
+        [
+          {"column": "城市", "value": "德州市"},
+          {"column": "日期", "start": "2020-07-01", "end": "2020-08-31"}
+        ]
+
+    - ``value`` → exact / substring match  (normalised, case-insensitive).
+    - ``start`` / ``end`` → inclusive range comparison on the raw cell text.
+      Dates should be normalised to ``YYYY-MM-DD`` by the LLM.
+    - An empty array ``[]`` means "no filtering needed" (all rows pass).
+    """
+    headers_str = json.dumps(available_headers, ensure_ascii=False)
+    return (
+        "你是数据过滤专家。根据下面的【表格上下文】和【用户要求】，判断 Excel "
+        "参考数据中哪些列需要按条件过滤，只保留符合要求的行。\n\n"
+        + _format_requirement(requirement)
+        + f"【表格上下文(描述当前要填的表)】:\n{context or '(无)'}\n\n"
+        + f"【Excel 参考数据可用的列名】:\n{headers_str}\n\n"
+        "规则:\n"
+        "  1. 只返回有明确约束值的列。没有约束的列不要出现。\n"
+        "  2. 精确值用 {\"column\":\"列名\", \"value\":\"值\"} 格式。\n"
+        "  3. 日期/数值范围用 {\"column\":\"列名\", \"start\":\"起始\", \"end\":\"结束\"} 格式，"
+        "日期统一 YYYY-MM-DD。\n"
+        "  4. 如果上下文和要求都没有给出任何过滤条件，返回空数组 []。\n\n"
+        "严格只返回 JSON 数组，禁止解释、禁止 Markdown 代码块。\n"
+        '示例: [{"column":"城市","value":"德州市"},{"column":"日期","start":"2020-07-01","end":"2020-08-31"}]\n'
+        "无过滤时: []\n"
+    )

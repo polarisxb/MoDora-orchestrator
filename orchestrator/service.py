@@ -629,6 +629,56 @@ def ingest_status():
     }
 
 
+async def _filter_excel_rows(
+    sheets: List[excel_matcher.SheetIndex],
+    context: str,
+    requirement: str,
+) -> List[excel_matcher.SheetIndex]:
+    """Use an LLM call to derive row-level filters, then apply them.
+
+    Returns the original *sheets* unchanged when:
+    - there are no sheets to filter,
+    - the LLM returns ``[]`` (no filtering needed), or
+    - any error occurs (fail-open to avoid losing data).
+    """
+    if not sheets:
+        return sheets
+    # Collect all unique raw headers across sheets so the LLM can see what
+    # columns are available for filtering.
+    all_headers: List[str] = []
+    seen: set = set()
+    for s in sheets:
+        for h in s.raw_headers:
+            if h and h not in seen:
+                seen.add(h)
+                all_headers.append(h)
+    if not all_headers:
+        return sheets
+
+    prompt = llm.build_excel_filter_prompt(context, requirement, all_headers)
+    try:
+        raw = await llm.chat(prompt, timeout=30.0)
+        parsed = llm.extract_json(raw)
+    except llm.LLMError:
+        logger.warning("excel filter LLM call failed — skipping filter (all rows kept)")
+        return sheets
+
+    if not isinstance(parsed, list):
+        logger.warning("excel filter returned non-list %r — skipping", type(parsed).__name__)
+        return sheets
+    # Normalise filter dicts — drop any malformed entries.
+    filters: List[dict] = []
+    for item in parsed:
+        if isinstance(item, dict) and "column" in item:
+            filters.append(item)
+    if not filters:
+        logger.info("excel filter: LLM returned no filters — all rows kept")
+        return sheets
+
+    logger.info("excel filter: applying %d filter(s): %s", len(filters), filters)
+    return excel_matcher.apply_row_filters(sheets, filters)
+
+
 async def _fill_one_table(
     ti: table_ops.TemplateInfo,
     *,
@@ -666,6 +716,11 @@ async def _fill_one_table(
     parent_cols, child_cols = await _detect_structure(context, headers, requirement)
     logger.info("table[%d] parent_cols=%s child_cols=%s", tidx, parent_cols, child_cols)
 
+    # -------- 4.5. pre-filter Excel rows by context + requirement --------
+    filtered_sheets = await _filter_excel_rows(
+        excel_sheets, context, requirement,
+    )
+
     # -------- 5. extract parent entities --------
     parent_headers = [headers[i] for i in parent_cols]
     child_headers = [headers[i] for i in child_cols]
@@ -673,7 +728,7 @@ async def _fill_one_table(
     excel_rows: List[List[str]] = []
     all_rows: List[List[str]] = []
     if parent_cols:
-        excel_rows = excel_matcher.extract_parent_entities(excel_sheets, parent_headers)
+        excel_rows = excel_matcher.extract_parent_entities(filtered_sheets, parent_headers)
         modora_rows = await asyncio.gather(
             _extract_parent_entities_for_channel(
                 md_txt_paths, context, parent_headers, child_headers, requirement,
@@ -737,7 +792,7 @@ async def _fill_one_table(
                 continue
             coord = f"{r_idx}_{col}"
             match = excel_matcher.lookup_child_value(
-                excel_sheets, parent_values, headers[col],
+                filtered_sheets, parent_values, headers[col],
             )
             if match is not None:
                 value, source_tag = match
