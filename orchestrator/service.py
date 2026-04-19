@@ -54,8 +54,10 @@ from dotenv import load_dotenv
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _REPO_ROOT / ".env"
+_ENV_LOADED = False
 if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE)
+    load_dotenv(_ENV_FILE, override=False)
+    _ENV_LOADED = True
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,6 +80,22 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger("orchestrator")
+
+# -- .env diagnostics (so operators can spot misconfiguration instantly) --
+_api_key = os.environ.get("LLM_API_KEY", "")
+_key_preview = f"{_api_key[:6]}…{_api_key[-4:]}" if len(_api_key) >= 12 else "(empty)"
+logger.info(
+    ".env loaded=%s path=%s  LLM_API_KEY=%s  LLM_MODEL=%s",
+    _ENV_LOADED,
+    _ENV_FILE if _ENV_LOADED else "(missing — using process env only)",
+    _key_preview,
+    os.environ.get("LLM_MODEL", "(default)"),
+)
+if not _api_key or _api_key.startswith("replace-me") or _api_key == "sk-xxxx":
+    logger.warning(
+        "LLM_API_KEY missing or placeholder — LLM calls will fail. "
+        "Check .env at %s", _ENV_FILE,
+    )
 
 
 app = FastAPI(title="MoDora Orchestrator", version="0.2.0")
@@ -505,12 +523,22 @@ async def _dispatch_questions(
 @app.get("/health")
 def health():
     """Liveness + a cheap snapshot of registry state for runbook debugging."""
+    api_key = os.environ.get("LLM_API_KEY", "")
     return {
         "status": "ok",
         "registry": {
             "count": ingest_registry.count(),
             "db": ingest_registry.db_path(),
             "ingest_dir": str(_INGEST_DIR),
+        },
+        "env": {
+            "env_file_loaded": _ENV_LOADED,
+            "env_file_path": str(_ENV_FILE),
+            "llm_api_key_set": bool(api_key) and not api_key.startswith("replace-me"),
+            "llm_api_key_preview": (
+                f"{api_key[:6]}…{api_key[-4:]}" if len(api_key) >= 12 else "(empty)"
+            ),
+            "llm_model": os.environ.get("LLM_MODEL", "(default)"),
         },
     }
 

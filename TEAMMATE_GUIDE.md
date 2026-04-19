@@ -185,12 +185,73 @@ python -m uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload
 curl.exe http://127.0.0.1:8888/health
 ```
 
-应该返回：
+应该返回（注意看 `env` 字段）：
 ```json
-{"status":"ok","registry":{"count":0,"db":"...","ingest_dir":"..."}}
+{
+  "status": "ok",
+  "registry": {"count": 0, "db": "...", "ingest_dir": "..."},
+  "env": {
+    "env_file_loaded": true,
+    "env_file_path": "D:\\MoDora-orchestrator\\.env",
+    "llm_api_key_set": true,
+    "llm_api_key_preview": "sk-xxx…abcd",
+    "llm_model": "qwen-plus"
+  }
+}
 ```
 
 > ⚠️ **注意用 `curl.exe` 而不是 `curl`**。PowerShell 的 `curl` 是 `Invoke-WebRequest` 的别名，行为不同。
+
+### 如果 `env_file_loaded: false` 或 `llm_api_key_set: false`
+
+说明 `.env` 没生效。按这个顺序排查（**不要**听别的 AI 让你加 `--env-file`，uvicorn 根本没这个参数）：
+
+**① 确认文件名和位置**
+
+```powershell
+# 必须在项目根目录（和 orchestrator/ 同级）
+ls D:\MoDora-orchestrator\.env
+```
+
+- 文件名必须是 `.env`，不是 `.env.example`、不是 `.env.txt`
+- 位置必须在 **repo 根目录**，不是 `orchestrator\` 子目录下
+- Windows 资源管理器默认隐藏以点开头的文件 → 建议用 `ls` 或 VS Code 确认
+
+**② 确认文件编码**
+
+Windows 记事本保存会加 UTF-8 BOM，`python-dotenv` 可能解析失败：
+```powershell
+# 用 VS Code 打开 .env → 右下角确认是 "UTF-8"（不是 "UTF-8 with BOM"）
+# 或命令行查：
+Get-Content D:\MoDora-orchestrator\.env -Encoding Byte -TotalCount 3
+# 如果前三个字节是 239 187 191 → 有 BOM，需要重新用 UTF-8（无 BOM）保存
+```
+
+**③ 确认内容格式**
+
+打开 `.env`，检查：
+- `LLM_API_KEY=sk-xxxx`  —— `=` 前后**不能有空格**
+- 值**不要**加引号（除非值本身含空格）
+- 没有中文引号 `"..."` 或全角字符
+- 注释用 `#`，不要用 `//`
+
+**④ 看 orchestrator 启动日志的第一行**
+
+启动窗口（窗口 3）应该有这行：
+```
+orchestrator - .env loaded=True path=...\.env  LLM_API_KEY=sk-xxx…abcd  LLM_MODEL=qwen-plus
+```
+如果 `loaded=False`，说明文件路径不对。
+
+**⑤ 兜底方案：直接设进程环境变量**
+
+如果以上都不行（比如 `.env` 里有奇怪字符），可以在启动 orchestrator 的那个窗口里**先**设置变量，再启动：
+```powershell
+$env:LLM_API_KEY = "sk-你的真实key"
+$env:LLM_MODEL   = "qwen-plus"
+python -m uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload
+```
+这样绕开了 `.env` 文件，直接用进程环境变量，`curl /health` 应该立刻看到 `llm_api_key_set: true`。
 
 ---
 
