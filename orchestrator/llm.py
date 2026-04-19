@@ -308,6 +308,40 @@ def render_question(
     return f"{child_header} 是多少?"
 
 
+def build_batch_child_prompt(
+    docs_content: str,
+    requirement: str,
+    parent_headers: List[str],
+    child_header: str,
+    parent_rows: List[Dict[str, str]],
+) -> str:
+    """Build a prompt that extracts *child_header* for ALL *parent_rows* at once.
+
+    This is the key performance optimisation: instead of N individual /chat
+    round-trips (one per row), we make ONE LLM call per child column and get
+    back a JSON array of values in the same order as ``parent_rows``.
+
+    Return contract: a JSON array of strings (or ``null`` for unknowns),
+    **same length and order** as ``parent_rows``.
+    """
+    rows_json = json.dumps(parent_rows, ensure_ascii=False)
+    return (
+        "你是数据提取专家。请从文档中为下列每一行提取指定指标的值。\n\n"
+        + _format_requirement(requirement)
+        + f"【要提取的指标】: {child_header}\n"
+        + f"【父列名称】: {json.dumps(parent_headers, ensure_ascii=False)}\n\n"
+        + f"【待查询的行】(共 {len(parent_rows)} 行, JSON 数组):\n{rows_json}\n\n"
+        + f"【文档数据】:\n{docs_content}\n\n"
+        "规则:\n"
+        "  1. 返回一个 JSON 数组，长度必须等于待查询行数，顺序一一对应。\n"
+        "  2. 值为字符串；若文档中没有对应数据，填 null。\n"
+        "  3. 只提取文档中明确存在的值，不可编造。\n"
+        "  4. 数值保留原始精度（不要四舍五入）。\n\n"
+        "严格只返回 JSON 数组，禁止解释、禁止 Markdown 代码块。\n"
+        '示例: ["1.23", "0.87", null, "2.15"]\n'
+    )
+
+
 def build_excel_filter_prompt(
     context: str,
     requirement: str,

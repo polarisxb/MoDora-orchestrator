@@ -629,6 +629,81 @@ def ingest_status():
     }
 
 
+_BATCH_MAX_ROWS = 80  # split into chunks if more rows than this
+
+
+async def _batch_extract_child_column(
+    child_header: str,
+    parent_headers: List[str],
+    rows_to_query: List[Dict[str, str]],
+    md_txt_paths: List[str],
+    word_paths: List[str],
+    requirement: str,
+    context: str,
+) -> List[Optional[str]]:
+    """Extract *child_header* for all *rows_to_query* via ONE LLM call.
+
+    Returns a list the same length as *rows_to_query*.  Each element is either
+    the extracted string value or ``None`` if the LLM could not find it.
+
+    When the row count exceeds :data:`_BATCH_MAX_ROWS` the list is split into
+    chunks and the chunks are sent in parallel.
+    """
+    all_paths = md_txt_paths + word_paths
+    if not all_paths or not rows_to_query:
+        return [None] * len(rows_to_query)
+
+    docs_text = _concat_channel_texts(all_paths, limit=MAX_DOCS_CHARS_PER_CHANNEL)
+    if not docs_text.strip():
+        return [None] * len(rows_to_query)
+
+    async def _one_chunk(chunk: List[Dict[str, str]]) -> List[Optional[str]]:
+        prompt = llm.build_batch_child_prompt(
+            docs_text, requirement, parent_headers, child_header, chunk,
+        )
+        try:
+            raw = await llm.chat(prompt, model=None, timeout=60.0)
+            parsed = llm.extract_json(raw)
+        except llm.LLMError:
+            logger.warning(
+                "batch child extraction failed for %s (%d rows)",
+                child_header, len(chunk),
+            )
+            return [None] * len(chunk)
+        if not isinstance(parsed, list):
+            logger.warning(
+                "batch child returned non-list for %s — got %s",
+                child_header, type(parsed).__name__,
+            )
+            return [None] * len(chunk)
+        # Pad / trim to match input length
+        result: List[Optional[str]] = []
+        for i in range(len(chunk)):
+            if i < len(parsed) and parsed[i] is not None:
+                val = str(parsed[i]).strip()
+                if val and not backend_client.is_invalid_answer(val):
+                    result.append(val)
+                else:
+                    result.append(None)
+            else:
+                result.append(None)
+        return result
+
+    # Split into chunks if necessary
+    if len(rows_to_query) <= _BATCH_MAX_ROWS:
+        return await _one_chunk(rows_to_query)
+
+    chunks = [
+        rows_to_query[i : i + _BATCH_MAX_ROWS]
+        for i in range(0, len(rows_to_query), _BATCH_MAX_ROWS)
+    ]
+    chunk_results = await asyncio.gather(*[_one_chunk(c) for c in chunks])
+    flat: List[Optional[str]] = []
+    for cr in chunk_results:
+        flat.extend(cr)
+    return flat
+
+
 async def _filter_excel_rows(
     sheets: List[excel_matcher.SheetIndex],
     context: str,
@@ -758,25 +833,27 @@ async def _fill_one_table(
         table_ops.write_excel_cells(ti.doc_obj, parent_fill)
     logger.info("table[%d] first fill wrote %d cells", tidx, len(parent_fill))
 
-    # -------- 6.5. route channel files (G2) --------
+    # -------- 6.5. route channel files (G2, for MoDora fallback) --------
     md_txt_routed, word_routed = await asyncio.gather(
         _route_channel_files(md_txt_docs, parent_headers, child_headers, all_rows, requirement),
         _route_channel_files(word_docs,   parent_headers, child_headers, all_rows, requirement),
     )
-    md_txt_modora_fns = [d.modora_filename for d in md_txt_routed if d.modora_filename]
-    word_modora_fns   = [d.modora_filename for d in word_routed   if d.modora_filename]
     logger.info(
         "table[%d] after routing: md_txt=%d word=%d",
-        tidx, len(md_txt_modora_fns), len(word_modora_fns),
+        tidx,
+        sum(1 for d in md_txt_routed if d.modora_filename),
+        sum(1 for d in word_routed if d.modora_filename),
     )
 
-    # -------- 7. generate child questions (Excel direct match first) --------
+    # -------- 7. resolve child values (Excel → batch LLM → MoDora fallback) --------
     if kind == "word":
         grid = table_ops.get_word_grid(ti.doc_obj, table_index=tidx)
     else:
         grid = table_ops.get_excel_grid(ti.doc_obj)
 
-    questions: Dict[str, str] = {}
+    # 7a: collect data rows and try Excel direct match first.
+    #   data_rows[i] = (grid_row_idx, parent_values_dict)
+    data_rows: List[tuple] = []
     excel_child_fill: Dict[str, str] = {}
     for r_idx, row in enumerate(grid):
         if r_idx == 0:
@@ -787,6 +864,7 @@ async def _fill_one_table(
                 parent_values[headers[col]] = row[col]
         if parent_cols and not parent_values:
             continue
+        data_rows.append((r_idx, parent_values))
         for col in child_cols:
             if col >= len(headers):
                 continue
@@ -801,23 +879,75 @@ async def _fill_one_table(
                     "table[%d] excel direct %s=%r (%s)",
                     tidx, coord, value, source_tag,
                 )
+
+    # 7b: batch LLM extraction per child column (the big performance win).
+    #   For each child column we send ONE LLM call with all parent rows,
+    #   reading the document text directly instead of N individual /chat hops.
+    batch_child_fill: Dict[str, str] = {}
+    batch_tasks = []
+    for col in child_cols:
+        if col >= len(headers):
+            continue
+        # Figure out which rows still need this column (not covered by Excel).
+        rows_needing: List[int] = []  # indices into data_rows
+        for dr_i, (r_idx, _pv) in enumerate(data_rows):
+            coord = f"{r_idx}_{col}"
+            if coord not in excel_child_fill:
+                rows_needing.append(dr_i)
+        if not rows_needing:
+            continue
+        query_rows = [data_rows[i][1] for i in rows_needing]
+        batch_tasks.append((col, rows_needing, query_rows))
+
+    if batch_tasks:
+        batch_results = await asyncio.gather(*[
+            _batch_extract_child_column(
+                headers[col], parent_headers, query_rows,
+                md_txt_paths, word_paths, requirement, context,
+            )
+            for col, _rn, query_rows in batch_tasks
+        ])
+        for (col, rows_needing, _qr), values in zip(batch_tasks, batch_results):
+            for dr_i, val in zip(rows_needing, values):
+                if val is not None:
+                    r_idx = data_rows[dr_i][0]
+                    batch_child_fill[f"{r_idx}_{col}"] = val
+
+    logger.info(
+        "table[%d] child: excel=%d batch_llm=%d",
+        tidx, len(excel_child_fill), len(batch_child_fill),
+    )
+
+    # 7c: MoDora fallback for cells that neither Excel nor batch LLM resolved.
+    questions: Dict[str, str] = {}
+    for dr_i, (r_idx, parent_values) in enumerate(data_rows):
+        for col in child_cols:
+            if col >= len(headers):
+                continue
+            coord = f"{r_idx}_{col}"
+            if coord in excel_child_fill or coord in batch_child_fill:
                 continue
             q = llm.render_question(parent_values, headers[col], requirement)
             questions[coord] = q
-    logger.info(
-        "table[%d] child: excel=%d residual=%d",
-        tidx, len(excel_child_fill), len(questions),
-    )
 
-    # -------- 8. dispatch residual questions (MoDora only) --------
-    modora_channels: Dict[str, List[str]] = {
-        "md_txt": md_txt_modora_fns,
-        "word":   word_modora_fns,
-    }
-    modora_child_fill = await _dispatch_questions(questions, modora_channels, requirement)
+    modora_child_fill: Dict[str, str] = {}
+    if questions:
+        logger.info(
+            "table[%d] MoDora fallback: %d residual questions",
+            tidx, len(questions),
+        )
+        md_txt_modora_fns = [d.modora_filename for d in md_txt_routed if d.modora_filename]
+        word_modora_fns   = [d.modora_filename for d in word_routed   if d.modora_filename]
+        modora_channels: Dict[str, List[str]] = {
+            "md_txt": md_txt_modora_fns,
+            "word":   word_modora_fns,
+        }
+        modora_child_fill = await _dispatch_questions(questions, modora_channels, requirement)
 
+    # Merge: Excel > batch LLM > MoDora (priority order).
     child_fill: Dict[str, str] = {}
     child_fill.update(modora_child_fill)
+    child_fill.update(batch_child_fill)
     child_fill.update(excel_child_fill)
 
     # -------- 9. second fill (child values) --------
