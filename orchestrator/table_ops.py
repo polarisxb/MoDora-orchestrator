@@ -38,6 +38,7 @@ class TemplateInfo:
     doc_obj: Any           # docx.Document or openpyxl.Workbook
     headers: List[str]     # flattened first-row headers (merged continuations -> "")
     context: str           # nearest paragraph(s) preceding the first table (word only)
+    table_index: int = 0   # which table inside the doc (Word multi-table; Excel always 0)
 
 
 # ---------------------------------------------------------------------------
@@ -46,19 +47,32 @@ class TemplateInfo:
 
 def _docx_paragraphs_before_first_table(doc) -> List[str]:
     """Collect non-empty paragraphs that appear before the first <w:tbl>."""
+    return _docx_context_for_table(doc, 0)
+
+
+def _docx_context_for_table(doc, table_index: int) -> List[str]:
+    """Collect non-empty paragraphs immediately preceding the *table_index*-th table.
+
+    For table 0 this is every paragraph before the first ``<w:tbl>``.  For
+    table N (N>0) we collect paragraphs between table N-1 and table N.
+    """
     from docx.oxml.ns import qn
 
     w_t = qn("w:t")
+    tables_seen = 0
     paragraphs: List[str] = []
     for child in doc.element.body.iterchildren():
         tag = child.tag.split("}")[-1]
-        if tag == "p":
+        if tag == "tbl":
+            if tables_seen == table_index:
+                break  # stop: we've reached the target table
+            tables_seen += 1
+            paragraphs.clear()  # reset: previous paragraphs belong to an earlier table
+        elif tag == "p":
             texts = child.findall(".//" + w_t)
             text = "".join(t.text or "" for t in texts).strip()
             if text:
                 paragraphs.append(text)
-        elif tag == "tbl":
-            break
     return paragraphs
 
 
@@ -83,15 +97,31 @@ def _docx_header_row(table) -> List[str]:
     return headers
 
 
-def load_word_template(path: str) -> TemplateInfo:
+def load_word_template(path: str) -> List[TemplateInfo]:
+    """Return one :class:`TemplateInfo` **per table** found in the Word doc.
+
+    Each entry carries its own ``headers`` (from the table's first row) and
+    ``context`` (paragraphs between the previous table and this one), so the
+    caller can process multi-table templates where every table has a different
+    scope (e.g. different city or time-period).
+    """
     from docx import Document
 
     doc = Document(path)
     if not doc.tables:
         raise ValueError("Word template contains no table")
-    context = "\n".join(_docx_paragraphs_before_first_table(doc))
-    headers = _docx_header_row(doc.tables[0])
-    return TemplateInfo(kind="word", doc_obj=doc, headers=headers, context=context)
+    infos: List[TemplateInfo] = []
+    for idx, tbl in enumerate(doc.tables):
+        ctx_lines = _docx_context_for_table(doc, idx)
+        infos.append(TemplateInfo(
+            kind="word",
+            doc_obj=doc,
+            headers=_docx_header_row(tbl),
+            context="\n".join(ctx_lines),
+            table_index=idx,
+        ))
+    logger.info("load_word_template: %d table(s) in %s", len(infos), path)
+    return infos
 
 
 def _set_cell_text_preserve_style(cell, text: str) -> None:
@@ -122,12 +152,13 @@ def _set_cell_text_preserve_style(cell, text: str) -> None:
 
 
 def _ensure_word_rows(table, required_rows: int) -> None:
+    """Append blank rows until the table has at least ``required_rows``."""
     while len(table.rows) < required_rows:
         table.add_row()
 
 
-def get_word_grid(doc) -> List[List[str]]:
-    """Return the first table as a 2-D list of strings.
+def get_word_grid(doc, table_index: int = 0) -> List[List[str]]:
+    """Return the *table_index*-th table as a 2-D list of strings.
 
     Merged continuation cells render as ``""`` so that ``grid[r][c]`` stays
     column-aligned with ``headers``.
@@ -135,7 +166,7 @@ def get_word_grid(doc) -> List[List[str]]:
     See :func:`_docx_header_row` for why dedup uses tc identity rather than
     ``id(tc)`` (id recycling after GC).
     """
-    table = doc.tables[0]
+    table = doc.tables[table_index]
     grid: List[List[str]] = []
     for row in table.rows:
         seen_tcs: set = set()
@@ -151,8 +182,8 @@ def get_word_grid(doc) -> List[List[str]]:
     return grid
 
 
-def write_word_cells(doc, data: Dict[str, str]) -> None:
-    """Write ``{"r_c": value}`` pairs into the first Word table.
+def write_word_cells(doc, data: Dict[str, str], table_index: int = 0) -> None:
+    """Write ``{"r_c": value}`` pairs into the *table_index*-th Word table.
 
     - Rows are appended as needed so callers may address coordinates beyond the
       template's starting row count.
@@ -168,7 +199,7 @@ def write_word_cells(doc, data: Dict[str, str]) -> None:
     """
     if not data:
         return
-    table = doc.tables[0]
+    table = doc.tables[table_index]
     max_row = max(int(k.split("_")[0]) for k in data.keys())
     _ensure_word_rows(table, max_row + 1)
 

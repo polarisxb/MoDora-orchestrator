@@ -629,6 +629,154 @@ def ingest_status():
     }
 
 
+async def _fill_one_table(
+    ti: table_ops.TemplateInfo,
+    *,
+    excel_sheets: List[excel_matcher.SheetIndex],
+    md_txt_docs: List[ingest_registry.IngestedDoc],
+    word_docs: List[ingest_registry.IngestedDoc],
+    md_txt_paths: List[str],
+    word_paths: List[str],
+    requirement: str,
+) -> None:
+    """Run the full fill pipeline (steps 4-9) for **one** table.
+
+    For single-table templates this is called once.  For Word documents
+    containing multiple independent tables (e.g. TC1: three cities in one
+    docx) this is called per table, each time with the table's own headers
+    and context so the LLM sees the right scope.
+
+    Modifies ``ti.doc_obj`` in place — all tables share the same underlying
+    Document / Workbook object.
+    """
+    kind = ti.kind
+    headers = ti.headers
+    context = ti.context
+    tidx = ti.table_index
+
+    if not any(h.strip() for h in headers):
+        logger.warning("table[%d] has empty headers, skipping", tidx)
+        return
+    logger.info(
+        "table[%d] start: headers=%s context=%r",
+        tidx, headers, context[:120] if context else "(none)",
+    )
+
+    # -------- 4. parent / child column classification --------
+    parent_cols, child_cols = await _detect_structure(context, headers, requirement)
+    logger.info("table[%d] parent_cols=%s child_cols=%s", tidx, parent_cols, child_cols)
+
+    # -------- 5. extract parent entities --------
+    parent_headers = [headers[i] for i in parent_cols]
+    child_headers = [headers[i] for i in child_cols]
+
+    excel_rows: List[List[str]] = []
+    all_rows: List[List[str]] = []
+    if parent_cols:
+        excel_rows = excel_matcher.extract_parent_entities(excel_sheets, parent_headers)
+        modora_rows = await asyncio.gather(
+            _extract_parent_entities_for_channel(
+                md_txt_paths, context, parent_headers, child_headers, requirement,
+            ),
+            _extract_parent_entities_for_channel(
+                word_paths, context, parent_headers, child_headers, requirement,
+            ),
+        )
+        all_rows.extend(excel_rows)
+        for rows in modora_rows:
+            all_rows.extend(rows)
+        all_rows = _dedupe_entity_rows(all_rows)
+    logger.info(
+        "table[%d] parent rows: excel=%d total=%d",
+        tidx, len(excel_rows), len(all_rows),
+    )
+
+    # -------- 6. first fill (parent entities) --------
+    parent_fill: Dict[str, str] = {}
+    for row_idx, row_vals in enumerate(all_rows, start=1):  # row 0 is header
+        for i, col in enumerate(parent_cols):
+            if i < len(row_vals):
+                parent_fill[f"{row_idx}_{col}"] = row_vals[i]
+    if kind == "word":
+        table_ops.write_word_cells(ti.doc_obj, parent_fill, table_index=tidx)
+    else:
+        table_ops.write_excel_cells(ti.doc_obj, parent_fill)
+    logger.info("table[%d] first fill wrote %d cells", tidx, len(parent_fill))
+
+    # -------- 6.5. route channel files (G2) --------
+    md_txt_routed, word_routed = await asyncio.gather(
+        _route_channel_files(md_txt_docs, parent_headers, child_headers, all_rows, requirement),
+        _route_channel_files(word_docs,   parent_headers, child_headers, all_rows, requirement),
+    )
+    md_txt_modora_fns = [d.modora_filename for d in md_txt_routed if d.modora_filename]
+    word_modora_fns   = [d.modora_filename for d in word_routed   if d.modora_filename]
+    logger.info(
+        "table[%d] after routing: md_txt=%d word=%d",
+        tidx, len(md_txt_modora_fns), len(word_modora_fns),
+    )
+
+    # -------- 7. generate child questions (Excel direct match first) --------
+    if kind == "word":
+        grid = table_ops.get_word_grid(ti.doc_obj, table_index=tidx)
+    else:
+        grid = table_ops.get_excel_grid(ti.doc_obj)
+
+    questions: Dict[str, str] = {}
+    excel_child_fill: Dict[str, str] = {}
+    for r_idx, row in enumerate(grid):
+        if r_idx == 0:
+            continue  # header row
+        parent_values: Dict[str, str] = {}
+        for col in parent_cols:
+            if col < len(row) and row[col]:
+                parent_values[headers[col]] = row[col]
+        if parent_cols and not parent_values:
+            continue
+        for col in child_cols:
+            if col >= len(headers):
+                continue
+            coord = f"{r_idx}_{col}"
+            match = excel_matcher.lookup_child_value(
+                excel_sheets, parent_values, headers[col],
+            )
+            if match is not None:
+                value, source_tag = match
+                excel_child_fill[coord] = value
+                logger.debug(
+                    "table[%d] excel direct %s=%r (%s)",
+                    tidx, coord, value, source_tag,
+                )
+                continue
+            q = llm.render_question(parent_values, headers[col], requirement)
+            questions[coord] = q
+    logger.info(
+        "table[%d] child: excel=%d residual=%d",
+        tidx, len(excel_child_fill), len(questions),
+    )
+
+    # -------- 8. dispatch residual questions (MoDora only) --------
+    modora_channels: Dict[str, List[str]] = {
+        "md_txt": md_txt_modora_fns,
+        "word":   word_modora_fns,
+    }
+    modora_child_fill = await _dispatch_questions(questions, modora_channels, requirement)
+
+    child_fill: Dict[str, str] = {}
+    child_fill.update(modora_child_fill)
+    child_fill.update(excel_child_fill)
+
+    # -------- 9. second fill (child values) --------
+    if kind == "word":
+        table_ops.write_word_cells(ti.doc_obj, child_fill, table_index=tidx)
+    else:
+        table_ops.write_excel_cells(ti.doc_obj, child_fill)
+    logger.info(
+        "table[%d] done: %d parent + %d child = %d cells",
+        tidx, len(parent_fill), len(child_fill),
+        len(parent_fill) + len(child_fill),
+    )
+
+
 @app.post("/process", summary="Template-driven table filling (uses /ingest'ed docs)")
 async def process(
     background_tasks: BackgroundTasks,
@@ -660,172 +808,50 @@ async def process(
     )
 
     # -------- 2. resolve reference docs from the registry --------
-    #   * excel_paths       : local xlsx paths — fed into excel_matcher.
-    #   * md_txt_local      : local md/txt/docx paths — fed into the LLM
-    #                         parent-entity extractor which prefers raw
-    #                         layout over OCR'd PDF.
-    #   * md_txt_modora_fns : filenames MoDora knows after /ingest — used
-    #                         verbatim as ChatRequest.file_names.
     excel_paths = [d.local_path for d in ingest_registry.by_channel("excel")]
     md_txt_docs = ingest_registry.by_channel("md_txt")
     word_docs   = ingest_registry.by_channel("word")
     md_txt_paths = [d.local_path for d in md_txt_docs]
     word_paths   = [d.local_path for d in word_docs]
-    md_txt_modora_fns = [d.modora_filename for d in md_txt_docs if d.modora_filename]
-    word_modora_fns   = [d.modora_filename for d in word_docs   if d.modora_filename]
     logger.info(
-        "registry snapshot: excel=%d md_txt=%d (modora_ready=%d) word=%d (modora_ready=%d)",
-        len(excel_paths),
-        len(md_txt_docs), len(md_txt_modora_fns),
-        len(word_docs),   len(word_modora_fns),
+        "registry snapshot: excel=%d md_txt=%d word=%d",
+        len(excel_paths), len(md_txt_docs), len(word_docs),
     )
 
-    # -------- 3. parse template --------
+    # -------- 3. parse template (multi-table aware) --------
     try:
         if kind == "word":
-            info = table_ops.load_word_template(design_path)
+            infos = table_ops.load_word_template(design_path)
         else:
-            info = table_ops.load_excel_template(design_path)
+            infos = [table_ops.load_excel_template(design_path)]
     except Exception as e:
         logger.exception("template parsing failed")
         raise HTTPException(status_code=400, detail=f"模板解析失败: {e}")
-    headers = info.headers
-    context = info.context
-    logger.info("headers=%s", headers)
-    if not any(h.strip() for h in headers):
+    if not any(any(h.strip() for h in ti.headers) for ti in infos):
         raise HTTPException(status_code=400, detail="模板表头为空,无法继续")
+    logger.info("template parsed: %d table(s)", len(infos))
 
-    # -------- 4. parent / child column classification --------
-    parent_cols, child_cols = await _detect_structure(context, headers, requirement)
-    logger.info("parent_cols=%s child_cols=%s", parent_cols, child_cols)
-
-    # -------- 5. extract parent entities --------
-    # Excel: deterministic header-to-header match (fast, lossless).
-    # md_txt / word: LLM extraction over concatenated text (in parallel).
-    parent_headers = [headers[i] for i in parent_cols]
-    child_headers = [headers[i] for i in child_cols]
-
+    # Build Excel index once (shared across all tables).
     excel_sheets = excel_matcher.build_index(excel_paths)
     logger.info("excel_matcher indexed %d sheet(s)", len(excel_sheets))
 
-    excel_rows: List[List[str]] = []
-    all_rows: List[List[str]] = []
-    if parent_cols:
-        excel_rows = excel_matcher.extract_parent_entities(excel_sheets, parent_headers)
-        modora_rows = await asyncio.gather(
-            _extract_parent_entities_for_channel(md_txt_paths, context, parent_headers, child_headers, requirement),
-            _extract_parent_entities_for_channel(word_paths,   context, parent_headers, child_headers, requirement),
+    # -------- 4-9. fill each table independently --------
+    for ti in infos:
+        await _fill_one_table(
+            ti,
+            excel_sheets=excel_sheets,
+            md_txt_docs=md_txt_docs,
+            word_docs=word_docs,
+            md_txt_paths=md_txt_paths,
+            word_paths=word_paths,
+            requirement=requirement,
         )
-        # Excel first so its ordering wins in the first-seen dedupe below.
-        all_rows.extend(excel_rows)
-        for rows in modora_rows:
-            all_rows.extend(rows)
-        all_rows = _dedupe_entity_rows(all_rows)
-    logger.info(
-        "parent entity rows: excel=%d total_after_dedupe=%d",
-        len(excel_rows), len(all_rows),
-    )
-
-    # -------- 6. first fill --------
-    parent_fill: Dict[str, str] = {}
-    for row_idx, row_vals in enumerate(all_rows, start=1):  # row 0 is header
-        for i, col in enumerate(parent_cols):
-            if i < len(row_vals):
-                parent_fill[f"{row_idx}_{col}"] = row_vals[i]
-    if kind == "word":
-        table_ops.write_word_cells(info.doc_obj, parent_fill)
-    else:
-        table_ops.write_excel_cells(info.doc_obj, parent_fill)
-    logger.info("first fill wrote %d cells", len(parent_fill))
-
-    # -------- 6.5. route channel files (G2) --------
-    # We now know the parent-entity rows we need to ask about. Use them to ask
-    # the LLM which files are actually worth dispatching /chat against. This
-    # materially reduces token cost and prevents unrelated 6-file pile-ons
-    # from diluting MoDora's retrieval. On failure we keep every file (the
-    # original pre-G2 behaviour), so routing is strictly additive — never a
-    # regression.
-    md_txt_routed, word_routed = await asyncio.gather(
-        _route_channel_files(md_txt_docs, parent_headers, child_headers, all_rows, requirement),
-        _route_channel_files(word_docs,   parent_headers, child_headers, all_rows, requirement),
-    )
-    md_txt_modora_fns = [d.modora_filename for d in md_txt_routed if d.modora_filename]
-    word_modora_fns   = [d.modora_filename for d in word_routed   if d.modora_filename]
-    logger.info(
-        "after routing: md_txt=%d word=%d",
-        len(md_txt_modora_fns), len(word_modora_fns),
-    )
-
-    # -------- 7. generate child questions (Excel direct match first) --------
-    if kind == "word":
-        grid = table_ops.get_word_grid(info.doc_obj)
-    else:
-        grid = table_ops.get_excel_grid(info.doc_obj)
-
-    questions: Dict[str, str] = {}
-    excel_child_fill: Dict[str, str] = {}
-    for r_idx, row in enumerate(grid):
-        if r_idx == 0:
-            continue  # header row
-        parent_values: Dict[str, str] = {}
-        for col in parent_cols:
-            if col < len(row) and row[col]:
-                parent_values[headers[col]] = row[col]
-        if parent_cols and not parent_values:
-            # parent-bearing template but this row has no parent filled yet —
-            # skipping avoids generating ambiguous questions.
-            continue
-        for col in child_cols:
-            if col >= len(headers):
-                continue
-            coord = f"{r_idx}_{col}"
-
-            # 7a: try deterministic Excel lookup. Structured source hits win.
-            match = excel_matcher.lookup_child_value(
-                excel_sheets, parent_values, headers[col],
-            )
-            if match is not None:
-                value, source_tag = match
-                excel_child_fill[coord] = value
-                logger.debug("excel direct match %s=%r (%s)", coord, value, source_tag)
-                continue
-
-            # 7b: defer to MoDora via the LLM question pipeline.
-            q = llm.render_question(parent_values, headers[col], requirement)
-            questions[coord] = q
-    logger.info(
-        "child cells resolved by excel=%d; residual questions=%d",
-        len(excel_child_fill), len(questions),
-    )
-
-    # -------- 8. dispatch residual questions (MoDora only) --------
-    # Excel channel has already been consulted in step 7a, so we restrict
-    # dispatch to the two MoDora textual channels. The values here are the
-    # **MoDora-side filenames** (populated during /ingest), not local paths,
-    # because MoDora's /chat resolves them against its own docs_dir.
-    modora_channels: Dict[str, List[str]] = {
-        "md_txt": md_txt_modora_fns,
-        "word":   word_modora_fns,
-    }
-    modora_child_fill = await _dispatch_questions(questions, modora_channels, requirement)
-
-    # Merge: Excel direct hits override MoDora for the same coord (should not
-    # collide because step 7 only queues non-Excel coords, but be defensive).
-    child_fill: Dict[str, str] = {}
-    child_fill.update(modora_child_fill)
-    child_fill.update(excel_child_fill)
-
-    # -------- 9. second fill --------
-    if kind == "word":
-        table_ops.write_word_cells(info.doc_obj, child_fill)
-    else:
-        table_ops.write_excel_cells(info.doc_obj, child_fill)
 
     # -------- 10. persist + return --------
     out_name = f"filled_{design_name}"
     out_path = os.path.join(temp_dir, out_name)
     try:
-        table_ops.save_template(info, out_path)
+        table_ops.save_template(infos[0], out_path)  # all infos share same doc_obj
     except Exception as e:
         logger.exception("failed to save filled template")
         raise HTTPException(status_code=500, detail=f"保存失败: {e}")
