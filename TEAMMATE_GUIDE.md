@@ -144,44 +144,53 @@ All offline smoke tests PASSED.
 
 ## 五、启动服务
 
-需要开 **两个** PowerShell 窗口（都要先激活虚拟环境）。
+需要开 **三个** PowerShell 窗口（都要先 `cd` 到项目目录 + 激活虚拟环境）。
 
-### 窗口 1：启动 orchestrator
+> 每个窗口都先执行：
+> ```powershell
+> cd D:\MoDora-orchestrator      # 换成你的项目路径
+> .\.venv\Scripts\Activate.ps1
+> ```
 
-```powershell
-cd D:\MoDora-orchestrator      # 你的项目目录
-.\.venv\Scripts\Activate.ps1
-uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload
-```
-
-看到类似下面的输出就说明启动成功了：
-```
-INFO:     Uvicorn running on http://127.0.0.1:8888 (Press CTRL+C to quit)
-INFO:     Started reloader process [xxxxx]
-```
-
-### 窗口 2：启动 MoDora 后端
-
-如果你有真正的 MoDora 后端，按它的文档启动。
-如果**没有**，可以用我们的 mock 代替（用于基本功能测试）：
+### 窗口 1：mock_modora（md_txt 通道，端口 8005）
 
 ```powershell
-cd D:\MoDora-orchestrator
-.\.venv\Scripts\Activate.ps1
 python -m uvicorn orchestrator.mock_modora:app --host 127.0.0.1 --port 8005
 ```
 
+### 窗口 2：mock_modora（word 通道，端口 8006）
+
+```powershell
+$env:MOCK_DOCS_DIR='C:\tmp\mock_modora_word'
+python -m uvicorn orchestrator.mock_modora:app --host 127.0.0.1 --port 8006
+```
+
+> 💡 两个 mock 实例需要不同的 `MOCK_DOCS_DIR`，否则文件会互相覆盖。
+
+### 窗口 3：orchestrator（端口 8888）
+
+```powershell
+python -m uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload
+```
+
+看到 `Uvicorn running on http://127.0.0.1:8888` 就说明启动成功了。
+
+> **如果你有真正的 MoDora 后端**，就不需要窗口 1 和 2，直接在 `.env` 里把
+> `BACKEND_MD_TXT_URL` 和 `BACKEND_WORD_URL` 指向真实 MoDora 的地址即可。
+
 ### 验证服务正常
 
-打开浏览器（或新开第三个 PowerShell），访问：
+打开第四个 PowerShell（或浏览器），运行：
 ```powershell
-curl http://127.0.0.1:8888/health
+curl.exe http://127.0.0.1:8888/health
 ```
 
 应该返回：
 ```json
 {"status":"ok","registry":{"count":0,"db":"...","ingest_dir":"..."}}
 ```
+
+> ⚠️ **注意用 `curl.exe` 而不是 `curl`**。PowerShell 的 `curl` 是 `Invoke-WebRequest` 的别名，行为不同。
 
 ---
 
@@ -352,6 +361,91 @@ curl.exe -X POST http://127.0.0.1:8888/process -F "design_file=@D:\test_data\模
 | 终端输出一堆乱码 | 忘了加 `-o` 保存文件 | 加上 `-o D:\test_data\结果.docx` |
 | 产出文件打开后格式乱了 | 可能是 bug | 截图 + 原模板 + 产出文件一起发给我 |
 | `curl` 不是内部命令 | Windows 旧版没自带 curl | 用 `curl.exe`（加 .exe）或者升级 Windows |
+
+---
+
+### Step F：赛方测试集（三个真实案例，直接复制粘贴）
+
+> 测试数据在 `testData\包含模板文件\` 目录下。下面的命令假设项目在 `D:\MoDora-orchestrator`，
+> 如果你的路径不同请替换。**每个 TC 之间不需要重启服务，但需要重新 ingest。**
+
+#### TC1：山东省空气质量（Word 多表 + Excel 20000 行，纯 Excel 匹配）
+
+```powershell
+# 1. Ingest（只有 Excel 素材）
+curl.exe -X POST http://127.0.0.1:8888/ingest `
+  -F "ref_excel=@testData\包含模板文件\2025山东省环境空气质量监测数据信息\山东省环境空气质量监测数据信息202512171921_0.xlsx"
+
+# 2. Process（Word 模板，3 个表：德州/潍坊/临沂）
+curl.exe -X POST http://127.0.0.1:8888/process `
+  -F "design_file=@testData\包含模板文件\2025山东省环境空气质量监测数据信息\2025山东省环境空气质量监测数据信息-模板.docx" `
+  -F "requirement=完成填表工作，要求提取表格中对应数据。模板文件中对应有三个表，并且每一个表上文均有对该表的描述。表一：监测时间：2025-11-25 09:00:00.0 城市：德州市 表二：监测时间：2025-11-25 09:00:00.0 城市：潍坊市 表三：监测时间：2025-11-25 09:00:00.0 城市：临沂市" `
+  -o testData\TC1_output.docx
+```
+
+**预期结果**：
+- 耗时 **< 60 秒**
+- 输出 `.docx` 包含 3 个表，分别填入德州市/潍坊市/临沂市的监测站点数据
+- 每个表 25~30 行，8 列全填满（0 空格子）
+- 用 Word 打开检查：城市列只包含对应城市，AQI/PM2.5 等数值合理
+
+---
+
+#### TC2：中国城市经济百强（Excel 模板 + Word 素材，100 行 × 5 列）
+
+```powershell
+# 1. Ingest（只有 Word 素材）
+curl.exe -X POST http://127.0.0.1:8888/ingest `
+  -F "ref_word=@testData\包含模板文件\2025年中国城市经济百强全景报告\2025年中国城市经济百强全景报告.docx"
+
+# 2. Process
+curl.exe -X POST http://127.0.0.1:8888/process `
+  -F "design_file=@testData\包含模板文件\2025年中国城市经济百强全景报告\2025年中国城市经济百强全景报告-模板.xlsx" `
+  -F "requirement=帮我智能填表" `
+  -o testData\TC2_output.xlsx
+```
+
+**预期结果**：
+- 耗时 **< 90 秒**（已验证 ~76 秒）
+- 输出 `.xlsx` 有 101 行（1 表头 + 100 城市），5 列：城市名/GDP/人口/人均GDP/公共预算
+- 500/500 单元格全填满
+- 用 Excel 打开检查：上海 GDP ~56700 亿，北京 ~52000 亿，数值量级合理即可
+
+---
+
+#### TC3：COVID-19 全球数据（Excel 模板 + Excel+Word 素材，日期范围过滤）
+
+```powershell
+# 1. Ingest（Excel + Word 混合素材）
+curl.exe -X POST http://127.0.0.1:8888/ingest `
+  -F "ref_excel=@testData\包含模板文件\COVID-19数据集\COVID-19全球数据集（节选）.xlsx" `
+  -F "ref_word=@testData\包含模板文件\COVID-19数据集\中国COVID-19新冠疫情情况.docx"
+
+# 2. Process
+curl.exe -X POST http://127.0.0.1:8888/process `
+  -F "design_file=@testData\包含模板文件\COVID-19数据集\COVID-19 模板.xlsx" `
+  -F "requirement=智能填表，将两个文件的内容中日期一列从2020/7/1到2020/8/31的数据填入模板中" `
+  -o testData\TC3_output.xlsx
+```
+
+**预期结果**：
+- 耗时 **< 60 秒**（已验证 ~52 秒）
+- 输出 `.xlsx` 有 ~43 行，6 列：国家/大洲/人均GDP/人口/每日检测数/病例数
+- 填充率 ≥ 99%（1~2 个空格子可以接受）
+- 用 Excel 打开检查：国家名都是英文（Albania, Algeria 等），数值量级合理
+
+---
+
+#### 测试结果对照表（我已验证通过的基准）
+
+| TC | 耗时 | 行数 | 填充率 | 关键检查点 |
+|----|------|------|--------|-----------|
+| TC1 | 56s | 3 表 × 25~30 行 | 100% | 每表只包含对应城市的数据 |
+| TC2 | 76s | 100 行 | 100% | GDP 数值量级在千亿~万亿 |
+| TC3 | 52s | 42 行 | 99.6% | 数据仅包含 2020/7/1~8/31 时间范围 |
+
+> ⚠️ 由于 LLM 有随机性，你跑出来的数值可能和我的略有不同，**量级对就行**。
+> 如果耗时 >90 秒或填充率 <80%，截图 + orchestrator 日志发给我。
 
 ---
 
