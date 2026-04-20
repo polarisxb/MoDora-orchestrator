@@ -342,6 +342,47 @@ def build_batch_child_prompt(
     )
 
 
+def build_batch_child_multi_prompt(
+    docs_content: str,
+    requirement: str,
+    parent_headers: List[str],
+    child_headers: List[str],
+    parent_rows: List[Dict[str, str]],
+) -> str:
+    """Extract **all** *child_headers* for **all** *parent_rows* in ONE call.
+
+    Return contract: a JSON array of objects, same length and order as
+    ``parent_rows``.  Each object maps ``child_header → value | null``.
+
+    Example (2 rows, 3 child cols)::
+
+        [
+          {"GDP": "1.23", "人口": "100", "面积": null},
+          {"GDP": "4.56", "人口": "200", "面积": "300"}
+        ]
+    """
+    rows_json = json.dumps(parent_rows, ensure_ascii=False)
+    children_json = json.dumps(child_headers, ensure_ascii=False)
+    sample_obj = ", ".join(f'"{h}": "..."' for h in child_headers[:3])
+    if len(child_headers) > 3:
+        sample_obj += ", ..."
+    return (
+        "你是数据提取专家。请从文档中为下列每一行提取所有指定指标的值。\n\n"
+        + _format_requirement(requirement)
+        + f"【要提取的指标】: {children_json}\n"
+        + f"【父列名称】: {json.dumps(parent_headers, ensure_ascii=False)}\n\n"
+        + f"【待查询的行】(共 {len(parent_rows)} 行, JSON 数组):\n{rows_json}\n\n"
+        + f"【文档数据】:\n{docs_content}\n\n"
+        "规则:\n"
+        "  1. 返回一个 JSON 数组，长度必须等于待查询行数，顺序一一对应。\n"
+        "  2. 数组每个元素是一个对象，键为指标名，值为字符串；若文档中没有对应数据，值填 null。\n"
+        "  3. 只提取文档中明确存在的值，不可编造。\n"
+        "  4. 数值保留原始精度（不要四舍五入）。\n\n"
+        "严格只返回 JSON 数组，禁止解释、禁止 Markdown 代码块。\n"
+        f'示例: [{{{sample_obj}}}]\n'
+    )
+
+
 def build_excel_filter_prompt(
     context: str,
     requirement: str,
@@ -377,4 +418,106 @@ def build_excel_filter_prompt(
         "严格只返回 JSON 数组，禁止解释、禁止 Markdown 代码块。\n"
         '示例: [{"column":"城市","value":"德州市"},{"column":"日期","start":"2020-07-01","end":"2020-08-31"}]\n'
         "无过滤时: []\n"
+    )
+
+
+def build_extract_prompt(
+    docs_content: str,
+    query: str,
+) -> str:
+    """Prompt for Module-2: extract structured information from a document.
+
+    Returns a JSON object with entities, key_info, and summary.
+    """
+    query_clause = f"【用户指定提取内容】: {query}\n\n" if query and query.strip() else ""
+    return (
+        "你是信息提取专家。请从以下文档中提取结构化信息。\n\n"
+        + query_clause
+        + f"【文档内容】:\n{docs_content}\n\n"
+        "请提取以下内容并以 JSON 格式返回:\n"
+        "{\n"
+        '  "summary": "文档摘要(100字以内)",\n'
+        '  "key_info": {\n'
+        '    "标题": "文档标题(如有)",\n'
+        '    "日期": "相关日期(如有)",\n'
+        '    "作者/机构": "作者或发布机构(如有)"\n'
+        "  },\n"
+        '  "entities": [\n'
+        '    {"type": "实体类别", "value": "实体值", "context": "出现的上下文片段"}\n'
+        "  ],\n"
+        '  "tables": [\n'
+        '    {"title": "表格标题或描述", "headers": ["列1","列2"], "row_count": 10}\n'
+        "  ]\n"
+        "}\n\n"
+        "规则:\n"
+        "  1. entities 中的 type 从以下类别中选: 人名, 机构, 地点, 日期, 金额, 百分比, 产品, 指标, 其他\n"
+        "  2. 只提取文档中明确存在的信息,不可编造\n"
+        "  3. 如果某个字段在文档中不存在,对应值填 null\n"
+        "  4. tables 只需描述文档中包含的表格概要,不需要提取完整数据\n\n"
+        "严格只返回 JSON 对象,禁止解释、禁止 Markdown 代码块。\n"
+    )
+
+
+def build_intent_prompt(
+    user_message: str,
+    has_files: bool,
+    file_names: List[str],
+) -> str:
+    """Classify user intent for the chat agent.
+
+    Returns one of: doc_edit, extract, fill_table, chat
+    """
+    files_clause = (
+        f"已附带的文件: {file_names}\n" if has_files else "用户未附带文件\n"
+    )
+    return (
+        "你是文档智能助手的意图分类器。请根据用户消息判断他想做什么。\n\n"
+        f"{files_clause}"
+        f"用户消息: {user_message}\n\n"
+        "可选意图:\n"
+        '  - "doc_edit"   : 编辑/排版/格式化 Word 文档（加粗/字体/对齐/插入文字 等）\n'
+        '  - "extract"    : 从文档中提取实体、关键信息、摘要\n'
+        '  - "fill_table" : 用素材填写空白表格模板（多文件协同操作）\n'
+        '  - "chat"       : 普通对话/问答（解释/建议/无具体操作）\n\n'
+        "返回 JSON: {\"intent\": \"<上述之一>\", \"reason\": \"简短说明\"}\n"
+        "严格只返回 JSON，禁止解释、禁止 Markdown 代码块。\n"
+    )
+
+
+def build_doc_edit_prompt(
+    instruction: str,
+    doc_structure: str,
+) -> str:
+    """Prompt for Module-1: parse a natural-language edit instruction into
+    a structured operation plan that python-docx can execute.
+
+    Returns a JSON array of edit operations.
+    """
+    return (
+        "你是文档编辑助手。用户想对一份 Word 文档执行操作。\n"
+        "请将用户的自然语言指令解析为可执行的编辑操作列表。\n\n"
+        f"【文档结构】:\n{doc_structure}\n\n"
+        f"【用户指令】: {instruction}\n\n"
+        "请返回一个 JSON 数组,每个元素是一个操作对象:\n"
+        "{\n"
+        '  "action": "操作类型",\n'
+        '  "target": "操作目标描述",\n'
+        '  "params": {具体参数}\n'
+        "}\n\n"
+        "支持的 action 类型:\n"
+        '  - "format_text": 格式化文字 params: {"bold":true/false, "italic":true/false, "underline":true/false, "font_name":"字体名", "font_size":磅值, "color":"#RRGGBB"}\n'
+        '  - "set_alignment": 设置对齐 params: {"alignment":"left/center/right/justify"}\n'
+        '  - "insert_text": 插入文字 params: {"position":"before/after", "text":"要插入的文字"}\n'
+        '  - "delete_text": 删除文字 params: {}\n'
+        '  - "replace_text": 替换文字 params: {"old":"原文", "new":"新文"}\n'
+        '  - "insert_table": 插入表格 params: {"rows":行数, "cols":列数, "headers":["列名1","列名2"]}\n'
+        '  - "set_heading": 设置标题级别 params: {"level":1-6}\n'
+        '  - "set_page_margin": 页边距 params: {"top":cm, "bottom":cm, "left":cm, "right":cm}\n\n'
+        "target 用来定位段落,格式: '第N段' 或 '包含XXX的段落' 或 '所有段落' 或 '标题'\n\n"
+        "规则:\n"
+        "  1. 只返回 JSON 数组,禁止解释\n"
+        "  2. 若指令不明确,做最合理的推断\n"
+        "  3. 一条用户指令可能对应多个操作\n\n"
+        "严格只返回 JSON 数组,禁止 Markdown 代码块。\n"
+        '示例: [{"action":"format_text","target":"第1段","params":{"bold":true}}]\n'
     )

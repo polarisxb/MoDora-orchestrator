@@ -1,0 +1,411 @@
+<!doctype html>
+<!--
+  MoDora · 企业模板工作台(企业版,保留手绘 DNA)
+  DNA: 暖纸底 + 手写问候 + 线稿插画 + 草图下划线
+  升级: Linear/Vercel 级信息密度 + 真实业务内容 + 状态指示
+  预览: 双击打开,或 `python -m http.server` 起本地 server
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>MoDora · 企业模板工作台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Ma+Shan+Zheng&family=Noto+Sans+SC:wght@300;400;500;600;700&family=Noto+Serif+SC:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: { extend: {
+    colors: {
+      paper: { 50:'#fdfbf6', 100:'#faf6ec', 200:'#f2ecdc' },
+      ink: { 50:'#f8fafc',100:'#f1f5f9',200:'#e2e8f0',300:'#cbd5e1',400:'#94a3b8',500:'#64748b',600:'#475569',700:'#334155',800:'#1e293b',900:'#0f172a' },
+      primary: { 50:'#eff6ff',100:'#dbeafe',200:'#bfdbfe',500:'#3b82f6',600:'#2563eb',700:'#1d4ed8' },
+    },
+    fontFamily: {
+      sans: ['Inter','"Noto Sans SC"','ui-sans-serif','system-ui','sans-serif'],
+      serif: ['"Noto Serif SC"','Georgia','serif'],
+      cursive: ['Caveat','cursive'],
+      brush: ['"Ma Shan Zheng"','"Noto Sans SC"','sans-serif'],
+      mono: ['"JetBrains Mono"','ui-monospace','monospace'],
+    },
+    boxShadow: {
+      soft: '0 1px 2px 0 rgba(15,23,42,.04), 0 1px 3px 1px rgba(15,23,42,.04)',
+      'soft-md': '0 2px 4px -2px rgba(15,23,42,.06), 0 4px 8px -2px rgba(15,23,42,.04)',
+    },
+  } },
+};
+</script>
+<style>
+html,body{font-family:'Inter','Noto Sans SC',-apple-system,BlinkMacSystemFont,sans-serif;background:#fbf9f3;color:#1e293b;-webkit-font-smoothing:antialiased}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.35;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.92' numOctaves='2' seed='7'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 .04 0'/></filter><rect width='220' height='220' filter='url(%23n)'/></svg>")}
+.brush-text{font-family:'Ma Shan Zheng','Noto Sans SC',sans-serif}
+.cursive-text{font-family:'Caveat',cursive}
+.sketch-underline{background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 8'><path d='M2 5 Q30 1 60 4 T118 5' stroke='%232563eb' stroke-width='2.5' fill='none' stroke-linecap='round'/></svg>");background-repeat:no-repeat;background-position:0 100%;background-size:100% 6px;padding-bottom:2px}
+.greeting-chip{transform:rotate(-1.5deg);transition:transform .3s ease}
+.greeting-chip:hover{transform:rotate(0) scale(1.02)}
+@keyframes pulse-slow{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(1.4)}}
+.pulse-slow{animation:pulse-slow 2.8s ease-in-out infinite;transform-origin:center}
+h1,h2,h3{word-break:keep-all}
+</style>
+</head>
+
+<body class="antialiased">
+<div class="relative z-10 min-h-screen flex flex-col">
+
+<!-- ===== Top Nav ===== -->
+<header class="sticky top-0 z-30 border-b border-ink-200/70 bg-white/75 backdrop-blur">
+  <div class="max-w-[1440px] mx-auto h-14 px-6 flex items-center justify-between">
+    <div class="flex items-center gap-6">
+      <a href="#" class="flex items-center gap-2.5 group">
+        <div class="w-8 h-8 rounded-lg bg-primary-600 text-white flex items-center justify-center transition-transform group-hover:-rotate-3">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2 L4 8 L12 14 L20 8 Z"/><path d="M4 16 L12 22 L20 16"/><path d="M4 12 L12 18 L20 12"/>
+          </svg>
+        </div>
+        <div class="flex items-baseline gap-2">
+          <span class="font-semibold text-[15px] text-ink-900 tracking-tight">MoDora</span>
+          <span class="text-xs text-ink-500 hidden sm:inline">Template Intelligence</span>
+        </div>
+      </a>
+      <nav class="hidden md:flex items-center gap-0.5 text-sm border-l border-ink-200 pl-5 ml-2">
+        <a class="px-3 py-1.5 rounded-md text-ink-900 font-medium bg-ink-100/80" href="#">工作台</a>
+        <a class="px-3 py-1.5 rounded-md text-ink-600 hover:text-ink-900 hover:bg-ink-100 transition-colors" href="#">模板库</a>
+        <a class="px-3 py-1.5 rounded-md text-ink-600 hover:text-ink-900 hover:bg-ink-100 transition-colors" href="#">历史</a>
+        <a class="px-3 py-1.5 rounded-md text-ink-600 hover:text-ink-900 hover:bg-ink-100 transition-colors" href="#">文档</a>
+      </nav>
+    </div>
+    <div class="flex items-center gap-2.5">
+      <div class="hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-[11px] text-emerald-700 font-medium">
+        <span class="relative flex w-1.5 h-1.5">
+          <span class="absolute inset-0 rounded-full bg-emerald-500 opacity-75 animate-ping"></span>
+          <span class="relative inline-flex rounded-full w-1.5 h-1.5 bg-emerald-600"></span>
+        </span>
+        AI 已连接
+      </div>
+      <span class="hidden lg:inline text-[11px] text-ink-400 font-mono">qwen-plus · 128k</span>
+      <button aria-label="搜索" class="w-9 h-9 rounded-md hover:bg-ink-100 text-ink-600 flex items-center justify-center transition-colors">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      </button>
+      <button aria-label="通知" class="w-9 h-9 rounded-md hover:bg-ink-100 text-ink-600 relative flex items-center justify-center transition-colors">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 0 0 4 0"/></svg>
+        <span class="absolute top-1.5 right-2 w-2 h-2 rounded-full bg-primary-600 ring-2 ring-white/75"></span>
+      </button>
+      <div class="w-px h-5 bg-ink-200 mx-1"></div>
+      <button class="w-8 h-8 rounded-full bg-gradient-to-br from-primary-600 to-primary-700 text-white text-sm font-medium flex items-center justify-center">研</button>
+    </div>
+  </div>
+</header>
+
+<!-- ===== Grid ===== -->
+<div class="flex-1 max-w-[1440px] w-full mx-auto px-6 py-8 grid lg:grid-cols-[296px_1fr] gap-6">
+
+  <!-- ========== Sidebar ========== -->
+  <aside class="space-y-4">
+
+    <!-- 问候 -->
+    <section class="rounded-xl border border-ink-200 bg-white p-5">
+      <div class="flex items-start justify-between">
+        <div class="greeting-chip inline-flex items-center gap-1.5 px-3 py-1 border-[1.5px] border-ink-800 rounded-full bg-paper-50">
+          <span class="w-1.5 h-1.5 rounded-full bg-ink-800"></span>
+          <span class="brush-text text-[17px] leading-none text-ink-900 pt-0.5">你好!</span>
+        </div>
+        <span class="cursive-text text-[13px] text-ink-400">Tue · Apr 21</span>
+      </div>
+      <h3 class="mt-3.5 text-sm font-semibold text-ink-900">研究员 · 李煦宸</h3>
+      <p class="mt-1 text-xs text-ink-500 leading-relaxed">
+        今天已生成 <span class="text-ink-900 font-semibold">3 份</span> 模板,平均耗时
+        <span class="text-ink-900 font-semibold">72 秒</span>,准确率
+        <span class="text-emerald-700 font-semibold">86%</span>。
+      </p>
+    </section>
+
+    <!-- 今日生成 -->
+    <section class="rounded-xl border border-ink-200 bg-white overflow-hidden">
+      <div class="px-5 pt-4 pb-3 flex items-center justify-between border-b border-ink-100">
+        <span class="text-[11px] font-semibold tracking-[0.14em] text-ink-500 uppercase">Today · 今日生成</span>
+        <button class="text-xs text-ink-500 hover:text-ink-900 transition-colors">全部</button>
+      </div>
+      <ul class="divide-y divide-ink-100">
+        <li class="px-5 py-3 hover:bg-paper-50 cursor-pointer transition-colors group">
+          <div class="flex items-start gap-3">
+            <div class="w-8 h-8 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-700 flex-shrink-0 flex items-center justify-center">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+            </div>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-medium text-ink-900 truncate">2024 Q3 山东环境空气质量</p>
+              <p class="text-[11px] text-ink-500 mt-0.5 font-mono">16 张表 · 86% · 68 s</p>
+            </div>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-ink-300 group-hover:text-ink-600 transition-colors mt-1"><path d="M9 18l6-6-6-6"/></svg>
+          </div>
+        </li>
+        <li class="px-5 py-3 hover:bg-paper-50 cursor-pointer transition-colors">
+          <div class="flex items-start gap-3">
+            <div class="w-8 h-8 rounded-md bg-primary-50 border border-primary-200 text-primary-700 flex-shrink-0 flex items-center justify-center">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin" style="animation-duration:3s"><path d="M21 12a9 9 0 1 1-6.2-8.6"/></svg>
+            </div>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-medium text-ink-900 truncate">国考职位表批量整理</p>
+              <p class="text-[11px] text-ink-500 mt-0.5 font-mono">分析中 · 2/25 列 · ≈ 45 s</p>
+              <div class="mt-1.5 h-1 rounded-full bg-ink-100 overflow-hidden">
+                <div class="h-full w-[14%] bg-primary-600 rounded-full"></div>
+              </div>
+            </div>
+          </div>
+        </li>
+        <li class="px-5 py-3 hover:bg-paper-50 cursor-pointer transition-colors">
+          <div class="flex items-start gap-3">
+            <div class="w-8 h-8 rounded-md bg-ink-100 border border-ink-200 text-ink-500 flex-shrink-0 flex items-center justify-center">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+            </div>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-medium text-ink-700 truncate">COVID-19 全球数据汇总</p>
+              <p class="text-[11px] text-ink-500 mt-0.5 font-mono">排队中 · 第 2 位</p>
+            </div>
+          </div>
+        </li>
+      </ul>
+    </section>
+
+    <!-- Live CCTree (对应原稿老虎位置) -->
+    <section class="rounded-xl border border-ink-200 bg-white p-5">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-[11px] font-semibold tracking-[0.14em] text-ink-500 uppercase">Live · CCTree</span>
+        <span class="inline-flex items-center gap-1 text-[11px] text-emerald-700">
+          <span class="w-1 h-1 rounded-full bg-emerald-600 animate-pulse"></span>正在构建
+        </span>
+      </div>
+      <div class="h-36 flex items-center justify-center">
+        <svg viewBox="0 0 260 140" class="w-full h-full">
+          <g stroke="#cbd5e1" stroke-width="1.1" fill="none" stroke-linecap="round">
+            <path d="M130 22 Q130 32 60 50 Q60 60 30 76"/>
+            <path d="M130 22 Q130 32 60 50 Q60 60 90 76"/>
+            <path d="M130 22 Q130 32 130 52"/>
+            <path d="M130 22 Q130 32 200 50 Q200 60 170 76"/>
+            <path d="M130 22 Q130 32 200 50 Q200 60 230 76"/>
+            <path d="M30 76 Q30 90 20 108"/>
+            <path d="M30 76 Q30 90 42 108"/>
+            <path d="M90 76 Q90 90 84 108"/>
+            <path d="M130 52 Q130 80 120 108"/>
+            <path d="M130 52 Q130 80 140 108"/>
+            <path d="M170 76 Q170 90 168 108"/>
+            <path d="M230 76 Q230 90 222 108"/>
+          </g>
+          <circle cx="130" cy="22" r="6" fill="#2563eb"/>
+          <circle cx="130" cy="22" r="12" fill="none" stroke="#2563eb" stroke-width="1.5" opacity=".4" class="pulse-slow"/>
+          <circle cx="60" cy="50" r="4" fill="#2563eb" opacity=".85"/>
+          <circle cx="130" cy="52" r="4" fill="#2563eb" opacity=".85"/>
+          <circle cx="200" cy="50" r="4" fill="#2563eb" opacity=".85"/>
+          <circle cx="30" cy="76" r="3" fill="#64748b"/>
+          <circle cx="90" cy="76" r="3" fill="#64748b"/>
+          <circle cx="170" cy="76" r="3" fill="#64748b"/>
+          <circle cx="230" cy="76" r="3" fill="#64748b"/>
+          <rect x="16" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <rect x="38" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <rect x="80" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <rect x="116" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <rect x="136" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <rect x="164" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <rect x="218" y="104" width="8" height="8" rx="1.5" fill="#94a3b8"/>
+          <text x="138" y="18" font-family="Caveat, cursive" font-size="12" fill="#64748b">root</text>
+        </svg>
+      </div>
+      <div class="mt-2 pt-3 border-t border-ink-100 grid grid-cols-3 gap-2 text-[11px] text-ink-500">
+        <div><div class="text-sm font-semibold text-ink-900 tabular-nums">24</div><div>节点</div></div>
+        <div><div class="text-sm font-semibold text-ink-900 tabular-nums">4</div><div>层级</div></div>
+        <div><div class="text-sm font-semibold text-primary-600 tabular-nums">68%</div><div>已分析</div></div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ========== Main ========== -->
+  <main class="space-y-6 min-w-0">
+
+    <!-- Hero -->
+    <section class="relative overflow-hidden rounded-2xl border border-ink-200 bg-white">
+      <div class="relative z-10 p-8 lg:p-10">
+        <div class="flex flex-wrap items-center gap-2 mb-7">
+          <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-primary-50 border border-primary-100 text-[11px] text-primary-700 font-medium">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 L3 14 h9 l-1 8 L21 10 h-9 z"/></svg>
+            Qwen-Plus · 128k
+          </span>
+          <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ink-100 text-[11px] text-ink-600 font-medium">批处理 · 多通道检索 · 自动仲裁</span>
+          <span class="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white border border-ink-200 text-[11px] text-ink-500 font-mono">65 s · avg</span>
+        </div>
+
+        <h1 class="font-serif text-[28px] lg:text-[38px] font-semibold text-ink-900 leading-[1.3] tracking-tight max-w-[680px]">
+          让 AI 自动读取 <span class="sketch-underline">素材</span>、理解
+          <span class="sketch-underline">结构</span>,<br/>
+          一键生成可交付的 <span class="text-primary-600">企业模板</span>。
+        </h1>
+        <p class="mt-5 text-sm lg:text-[15px] text-ink-600 leading-relaxed max-w-[560px]">
+          从 Excel、Word、Markdown 到业务结构 —— 统一在一个工作台里完成识别、对齐与填充。
+        </p>
+
+        <div class="mt-8 flex flex-col sm:flex-row gap-3 max-w-2xl">
+          <div class="flex-1 relative">
+            <svg class="absolute left-3.5 top-1/2 -translate-y-1/2 text-ink-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+            <input type="text" placeholder="描述你的需求,例如:按省份汇总 2024 Q1 各项污染物排放指标…" class="w-full h-11 pl-10 pr-4 rounded-md border border-ink-300 bg-white text-sm placeholder:text-ink-400 focus:outline-none focus:border-primary-600 focus:ring-2 focus:ring-primary-500/20 transition-all"/>
+          </div>
+          <button class="h-11 px-6 rounded-md bg-primary-600 hover:bg-primary-700 text-white text-sm font-medium transition-colors flex items-center justify-center gap-2 shadow-soft">
+            开始批量
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+          </button>
+        </div>
+
+        <div class="mt-6 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-ink-500">
+          <span class="inline-flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-emerald-600"><path d="M20 6 9 17l-5-5"/></svg>支持 .xlsx / .docx / .md / .txt</span>
+          <span class="inline-flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-emerald-600"><path d="M20 6 9 17l-5-5"/></svg>单模板 90 s 内完成</span>
+          <span class="inline-flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-emerald-600"><path d="M20 6 9 17l-5-5"/></svg>已服务 280+ 企业</span>
+        </div>
+      </div>
+
+      <!-- 右侧线稿插画(替换老虎/烟雾) -->
+      <div class="absolute top-0 right-0 w-[380px] h-full opacity-90 hidden xl:block pointer-events-none">
+        <svg viewBox="0 0 380 400" class="w-full h-full">
+          <g stroke="#cbd5e1" stroke-width="1.2" fill="none" stroke-linecap="round" opacity=".6">
+            <path d="M50 100 C 120 100, 150 180, 220 180"/>
+            <path d="M50 180 C 120 180, 150 200, 220 200"/>
+            <path d="M50 260 C 120 260, 150 220, 220 220"/>
+          </g>
+          <g>
+            <g stroke="#94a3b8" stroke-width="1.5" fill="none" stroke-linecap="round" opacity=".7">
+              <path d="M260 200 L240 140 M260 200 L300 130"/>
+              <path d="M260 200 L220 240 M260 200 L260 280 M260 200 L300 270"/>
+              <path d="M240 140 L230 100"/>
+              <path d="M300 130 L310 90 M300 130 L340 110"/>
+              <path d="M220 240 L200 280 M220 240 L210 300"/>
+              <path d="M260 280 L250 320 M260 280 L280 330"/>
+            </g>
+            <circle cx="260" cy="200" r="7" fill="#2563eb"/>
+            <circle cx="260" cy="200" r="14" fill="none" stroke="#2563eb" stroke-width="1.5" opacity=".4" class="pulse-slow"/>
+            <circle cx="240" cy="140" r="5" fill="#2563eb" opacity=".8"/>
+            <circle cx="300" cy="130" r="5" fill="#2563eb" opacity=".8"/>
+            <circle cx="220" cy="240" r="5" fill="#2563eb" opacity=".8"/>
+            <circle cx="260" cy="280" r="5" fill="#2563eb" opacity=".8"/>
+            <circle cx="300" cy="270" r="5" fill="#2563eb" opacity=".8"/>
+            <rect x="225" y="95" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+            <rect x="305" y="85" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+            <rect x="335" y="105" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+            <rect x="195" y="275" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+            <rect x="205" y="295" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+            <rect x="245" y="315" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+            <rect x="275" y="325" width="10" height="10" rx="2" fill="#64748b" opacity=".7"/>
+          </g>
+          <g stroke="#cbd5e1" stroke-width="1.2" fill="none" stroke-linecap="round" opacity=".6">
+            <path d="M320 190 C 360 190, 360 160, 380 160"/>
+            <path d="M320 200 C 360 200, 360 200, 380 200"/>
+            <path d="M320 210 C 360 210, 360 240, 380 240"/>
+          </g>
+          <text x="30" y="92" font-family="Caveat, cursive" font-size="14" fill="#64748b">raw excel</text>
+          <text x="30" y="172" font-family="Caveat, cursive" font-size="14" fill="#64748b">raw word</text>
+          <text x="30" y="252" font-family="Caveat, cursive" font-size="14" fill="#64748b">markdown</text>
+          <text x="238" y="372" font-family="Caveat, cursive" font-size="16" fill="#2563eb" font-weight="600">CCTree</text>
+        </svg>
+      </div>
+    </section>
+
+    <!-- 上传四格 -->
+    <section>
+      <div class="flex items-end justify-between mb-4">
+        <div>
+          <h2 class="text-lg font-semibold text-ink-900">从素材开始</h2>
+          <p class="text-xs text-ink-500 mt-0.5">选择一种或多种格式,MoDora 会并行识别每一份文件的结构</p>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+
+        <button class="group relative rounded-xl border border-ink-200 bg-white p-5 text-left transition-all hover:border-primary-300 hover:shadow-soft-md">
+          <div class="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center mb-3">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+          </div>
+          <h3 class="text-sm font-semibold text-ink-900">上传 Excel</h3>
+          <p class="mt-1 text-xs text-ink-500 leading-relaxed">含指标、多维参数的结构化数据表,自动识别表头层级与单位。</p>
+          <div class="mt-3 flex flex-wrap gap-1">
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 font-mono">.xlsx</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 font-mono">.xls</span>
+          </div>
+        </button>
+
+        <button class="group relative rounded-xl border border-ink-200 bg-white p-5 text-left transition-all hover:border-primary-300 hover:shadow-soft-md">
+          <div class="w-10 h-10 rounded-lg bg-primary-50 border border-primary-200 text-primary-700 flex items-center justify-center mb-3">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l1.5 4L10 10l1.5 4L13 10"/><path d="M16 8v8M16 8l-2 3M16 8l2 3"/></svg>
+          </div>
+          <h3 class="text-sm font-semibold text-ink-900">MD / TXT</h3>
+          <p class="mt-1 text-xs text-ink-500 leading-relaxed">报告、纪要、技术说明稿,自动解析段落结构与数据要点。</p>
+          <div class="mt-3 flex flex-wrap gap-1">
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 font-mono">.md</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 font-mono">.txt</span>
+          </div>
+        </button>
+
+        <button class="group relative rounded-xl border border-ink-200 bg-white p-5 text-left transition-all hover:border-primary-300 hover:shadow-soft-md">
+          <div class="w-10 h-10 rounded-lg bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center mb-3">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h9l5 5v15H6z"/><path d="M15 2v5h5"/><path d="M9 14l1.2 4L12 14l1.8 4L15 14"/></svg>
+          </div>
+          <h3 class="text-sm font-semibold text-ink-900">上传 Word</h3>
+          <p class="mt-1 text-xs text-ink-500 leading-relaxed">带格式的设计稿或收集表,保留标题层级,自动抽字段。</p>
+          <div class="mt-3 flex flex-wrap gap-1">
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 font-mono">.docx</span>
+          </div>
+        </button>
+
+        <button class="group relative rounded-xl border border-ink-200 bg-white p-5 text-left transition-all hover:border-primary-300 hover:shadow-soft-md">
+          <div class="w-10 h-10 rounded-lg bg-ink-100 border border-ink-200 text-ink-700 flex items-center justify-center mb-3">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="16" height="16" rx="2"/><path d="M7 9h8M7 13h8M7 17h5"/><circle cx="18.5" cy="18.5" r="3" stroke-dasharray="2 2"/><path d="M17 18.5l1.2 1.2 2-2"/></svg>
+          </div>
+          <h3 class="text-sm font-semibold text-ink-900">选择模板</h3>
+          <p class="mt-1 text-xs text-ink-500 leading-relaxed">已有的 .xlsx / .docx 模板直接复用,跳过结构识别。</p>
+          <div class="mt-3 flex flex-wrap gap-1">
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-ink-100 text-ink-600 font-mono">复用</span>
+          </div>
+        </button>
+      </div>
+    </section>
+
+    <!-- 底部:处理流水示意条 -->
+    <section class="rounded-xl border border-ink-200 bg-white p-5">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-sm font-semibold text-ink-900">处理流水</h2>
+          <p class="text-[11px] text-ink-500 mt-0.5">MoDora 的四步法 · 你可随时查看每一步的中间结果</p>
+        </div>
+        <span class="cursive-text text-sm text-ink-400">how it works</span>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+
+        <div class="relative p-3 rounded-lg border border-ink-200 bg-paper-50">
+          <div class="text-[11px] font-mono text-ink-400">01</div>
+          <div class="mt-1 text-sm font-semibold text-ink-900">OCR · 抽取</div>
+          <div class="mt-1 text-[11px] text-ink-500 leading-relaxed">PaddleOCR 切分 blocks,识别标题、正文、图表、页眉页脚。</div>
+        </div>
+        <div class="relative p-3 rounded-lg border border-ink-200 bg-paper-50">
+          <div class="text-[11px] font-mono text-ink-400">02</div>
+          <div class="mt-1 text-sm font-semibold text-ink-900">CCTree · 构建</div>
+          <div class="mt-1 text-[11px] text-ink-500 leading-relaxed">按层级组织成组件关联树,保留"侧栏 vs 正文"这类布局语义。</div>
+        </div>
+        <div class="relative p-3 rounded-lg border border-ink-200 bg-paper-50">
+          <div class="text-[11px] font-mono text-ink-400">03</div>
+          <div class="mt-1 text-sm font-semibold text-ink-900">Retrieve · 检索</div>
+          <div class="mt-1 text-[11px] text-ink-500 leading-relaxed">LLM 剪枝 + Embedding 兜底,多通道投票,位置感知定位。</div>
+        </div>
+        <div class="relative p-3 rounded-lg border border-ink-200 bg-paper-50">
+          <div class="text-[11px] font-mono text-ink-400">04</div>
+          <div class="mt-1 text-sm font-semibold text-ink-900">Fill · 填充</div>
+          <div class="mt-1 text-[11px] text-ink-500 leading-relaxed">按模板格式回填 Excel / Word,冲突自动仲裁,单位统一化。</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer class="border-t border-ink-200/60 mt-8">
+  <div class="max-w-[1440px] mx-auto px-6 py-4 flex items-center justify-between text-[11px] text-ink-400">
+    <span>MoDora v0.8 · built on CCTree (SIGMOD 2026)</span>
+    <span class="cursive-text text-[13px]">made with care ·  hand-drawn edition</span>
+  </div>
+</footer>
+</div>
+</body>
+</html>

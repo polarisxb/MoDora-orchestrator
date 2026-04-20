@@ -63,7 +63,20 @@ CHANNEL_URLS: Dict[str, str] = {
 # grounding is usually stronger evidence.
 CHANNEL_PRIORITY: Dict[str, int] = {"md_txt": 3, "word": 3, "excel": 2}
 
-_BACKEND_TIMEOUT = float(os.environ.get("BACKEND_TIMEOUT", "25"))
+_BACKEND_TIMEOUT = float(os.environ.get("BACKEND_TIMEOUT", "60"))
+
+# Shared connection pool — avoids TCP setup/teardown on every /chat call.
+_http_pool: Optional[httpx.AsyncClient] = None
+
+
+async def _get_pool() -> httpx.AsyncClient:
+    global _http_pool
+    if _http_pool is None or _http_pool.is_closed:
+        _http_pool = httpx.AsyncClient(
+            timeout=_BACKEND_TIMEOUT, trust_env=False,
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
+        )
+    return _http_pool
 
 
 # ---------------------------------------------------------------------------
@@ -212,11 +225,8 @@ async def _call_one(
     payload = _build_payload(channel, question, file_paths, coord, requirement)
 
     try:
-        # trust_env=False: MoDora channels are always on localhost. The
-        # Windows system proxy (e.g. Clash on 127.0.0.1:7889) would otherwise
-        # silently hijack loopback traffic and return 502.
-        async with httpx.AsyncClient(timeout=_BACKEND_TIMEOUT, trust_env=False) as client:
-            resp = await client.post(url, json=payload)
+        client = await _get_pool()
+        resp = await client.post(url, json=payload)
     except httpx.TimeoutException:
         logger.warning("backend %s timeout after %.1fs (coord=%s)", channel, _BACKEND_TIMEOUT, coord)
         return Candidate(channel=channel, answer=None, status="error",

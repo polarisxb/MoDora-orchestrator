@@ -46,6 +46,9 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import uuid
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -256,22 +259,46 @@ async def _detect_structure(context: str, headers: List[str], requirement: str):
     """
     prompt = llm.build_structure_prompt(context, headers, requirement)
     last_err: Optional[Exception] = None
+    parsed: Optional[dict] = None
     for attempt in range(2):
         try:
             raw = await llm.chat(prompt, timeout=60.0)
-            parsed = llm.extract_json(raw)
-            break
-        except llm.LLMError as e:
+            result = llm.extract_json(raw)
+            if isinstance(result, dict):
+                parsed = result
+                break
+            # extract_json returned a non-dict (e.g. list) — retry
+            logger.warning(
+                "structure detection attempt %d/2: expected dict, got %s",
+                attempt + 1, type(result).__name__,
+            )
+        except Exception as e:
             last_err = e
             logger.warning(
                 "structure detection attempt %d/2 failed: %s",
                 attempt + 1, e,
             )
-    else:
-        logger.error("structure detection failed after 2 attempts: %s", last_err)
-        raise HTTPException(status_code=500, detail="表头结构分析失败")
+
+    # Heuristic fallback helper
+    _PARENT_KW = {"名", "区", "省", "市", "国", "编号", "代码", "站点", "编码", "序号", "排名"}
+
+    def _heuristic() -> tuple:
+        logger.warning("structure detection: using heuristic fallback")
+        pc = [i for i, h in enumerate(headers) if any(kw in h for kw in _PARENT_KW)]
+        cc = [i for i in range(len(headers)) if i not in pc]
+        if not pc:
+            pc = [0]
+            cc = list(range(1, len(headers)))
+        return pc, cc
+
+    if parsed is None:
+        return _heuristic()
+
     parent_cols = [i for i in parsed.get("parent_columns", []) if 0 <= i < len(headers)]
     child_cols = [i for i in parsed.get("child_columns", []) if 0 <= i < len(headers)]
+    # Bug 2 guard: if both are empty, the LLM response was useless
+    if not parent_cols and not child_cols:
+        return _heuristic()
     return parent_cols, child_cols
 
 
@@ -650,6 +677,7 @@ async def ingest(
         "ingest complete: total=%d ok=%d failed=%d",
         len(summary), ok_count, len(summary) - ok_count,
     )
+    _record_op("ingest", f"文件数: {len(summary)}, 成功: {ok_count}")
     return {
         "count": len(summary),
         "succeeded": ok_count,
@@ -743,6 +771,106 @@ async def _batch_extract_child_column(
     for cr in chunk_results:
         flat.extend(cr)
     return flat
+
+
+async def _batch_extract_children_multi(
+    child_headers: List[str],
+    parent_headers: List[str],
+    rows_to_query: List[Dict[str, str]],
+    md_txt_paths: List[str],
+    word_paths: List[str],
+    requirement: str,
+    context: str,
+) -> Dict[str, List[Optional[str]]]:
+    """Extract **all** *child_headers* for **all** rows in ONE LLM call.
+
+    Returns ``{child_header: [val_or_None, ...]}`` where each list matches
+    the length of *rows_to_query*.
+
+    Internally chunks at :data:`_BATCH_MAX_ROWS` and merges results.
+    Falls back to per-column :func:`_batch_extract_child_column` on failure.
+    """
+    all_paths = md_txt_paths + word_paths
+    empty = {h: [None] * len(rows_to_query) for h in child_headers}
+    if not all_paths or not rows_to_query or not child_headers:
+        return empty
+
+    docs_text = _concat_channel_texts(all_paths, limit=MAX_DOCS_CHARS_PER_CHANNEL)
+    if not docs_text.strip():
+        return empty
+
+    async def _one_chunk(
+        chunk: List[Dict[str, str]],
+    ) -> List[Dict[str, Optional[str]]]:
+        prompt = llm.build_batch_child_multi_prompt(
+            docs_text, requirement, parent_headers, child_headers, chunk,
+        )
+        try:
+            raw = await llm.chat(prompt, model=None, timeout=90.0)
+            parsed = llm.extract_json(raw)
+        except llm.LLMError:
+            logger.warning(
+                "multi-child extraction failed (%d cols, %d rows), "
+                "falling back to per-column",
+                len(child_headers), len(chunk),
+            )
+            return []  # signal fallback
+        if not isinstance(parsed, list):
+            logger.warning(
+                "multi-child returned non-list — got %s, falling back",
+                type(parsed).__name__,
+            )
+            return []
+        # Normalise: ensure each element is a dict
+        result: List[Dict[str, Optional[str]]] = []
+        for i in range(len(chunk)):
+            if i < len(parsed) and isinstance(parsed[i], dict):
+                row_dict: Dict[str, Optional[str]] = {}
+                for h in child_headers:
+                    v = parsed[i].get(h)
+                    if v is not None:
+                        vs = str(v).strip()
+                        if vs and not backend_client.is_invalid_answer(vs):
+                            row_dict[h] = vs
+                        else:
+                            row_dict[h] = None
+                    else:
+                        row_dict[h] = None
+                result.append(row_dict)
+            else:
+                result.append({h: None for h in child_headers})
+        return result
+
+    # Chunk if necessary
+    if len(rows_to_query) <= _BATCH_MAX_ROWS:
+        chunks = [rows_to_query]
+    else:
+        chunks = [
+            rows_to_query[i : i + _BATCH_MAX_ROWS]
+            for i in range(0, len(rows_to_query), _BATCH_MAX_ROWS)
+        ]
+    chunk_results = await asyncio.gather(*[_one_chunk(c) for c in chunks])
+
+    # Check for fallback signal (empty list from any chunk)
+    need_fallback = any(len(cr) == 0 for cr in chunk_results)
+    if need_fallback:
+        logger.info("multi-child fallback → per-column extraction")
+        per_col = await asyncio.gather(*[
+            _batch_extract_child_column(
+                h, parent_headers, rows_to_query,
+                md_txt_paths, word_paths, requirement, context,
+            )
+            for h in child_headers
+        ])
+        return {h: vals for h, vals in zip(child_headers, per_col)}
+
+    # Merge chunks into per-column lists
+    merged: Dict[str, List[Optional[str]]] = {h: [] for h in child_headers}
+    for cr in chunk_results:
+        for row_dict in cr:
+            for h in child_headers:
+                merged[h].append(row_dict.get(h))
+    return merged
 
 
 async def _filter_excel_rows(
@@ -921,38 +1049,46 @@ async def _fill_one_table(
                     tidx, coord, value, source_tag,
                 )
 
-    # 7b: batch LLM extraction per child column (the big performance win).
-    #   For each child column we send ONE LLM call with all parent rows,
-    #   reading the document text directly instead of N individual /chat hops.
+    # 7b: batch LLM extraction — ALL child columns × ALL rows in ONE call.
+    #   Previous version made one LLM call per child column; this merges them
+    #   so a table with 4 child cols does 1 call instead of 4.
     batch_child_fill: Dict[str, str] = {}
-    batch_tasks = []
+
+    # Identify rows × columns that still need LLM extraction.
+    cols_needing: List[int] = []              # child col indices with residuals
+    rows_needing_set: set = set()             # union of dr_i across all cols
+    col_row_map: Dict[int, List[int]] = {}    # col → [dr_i, ...]
     for col in child_cols:
         if col >= len(headers):
             continue
-        # Figure out which rows still need this column (not covered by Excel).
-        rows_needing: List[int] = []  # indices into data_rows
+        rn: List[int] = []
         for dr_i, (r_idx, _pv) in enumerate(data_rows):
-            coord = f"{r_idx}_{col}"
-            if coord not in excel_child_fill:
-                rows_needing.append(dr_i)
-        if not rows_needing:
-            continue
-        query_rows = [data_rows[i][1] for i in rows_needing]
-        batch_tasks.append((col, rows_needing, query_rows))
+            if f"{r_idx}_{col}" not in excel_child_fill:
+                rn.append(dr_i)
+                rows_needing_set.add(dr_i)
+        if rn:
+            cols_needing.append(col)
+            col_row_map[col] = rn
 
-    if batch_tasks:
-        batch_results = await asyncio.gather(*[
-            _batch_extract_child_column(
-                headers[col], parent_headers, query_rows,
-                md_txt_paths, word_paths, requirement, context,
-            )
-            for col, _rn, query_rows in batch_tasks
-        ])
-        for (col, rows_needing, _qr), values in zip(batch_tasks, batch_results):
-            for dr_i, val in zip(rows_needing, values):
-                if val is not None:
+    if cols_needing:
+        # Build query rows: union of all rows needed by any child column.
+        rows_needing_sorted = sorted(rows_needing_set)
+        query_rows = [data_rows[i][1] for i in rows_needing_sorted]
+        dr_i_to_qi = {dr_i: qi for qi, dr_i in enumerate(rows_needing_sorted)}
+
+        multi_result = await _batch_extract_children_multi(
+            [headers[c] for c in cols_needing],
+            parent_headers, query_rows,
+            md_txt_paths, word_paths, requirement, context,
+        )
+        for col in cols_needing:
+            h = headers[col]
+            col_vals = multi_result.get(h, [])
+            for dr_i in col_row_map[col]:
+                qi = dr_i_to_qi.get(dr_i)
+                if qi is not None and qi < len(col_vals) and col_vals[qi] is not None:
                     r_idx = data_rows[dr_i][0]
-                    batch_child_fill[f"{r_idx}_{col}"] = val
+                    batch_child_fill[f"{r_idx}_{col}"] = col_vals[qi]
 
     logger.info(
         "table[%d] child: excel=%d batch_llm=%d",
@@ -1061,17 +1197,25 @@ async def process(
     excel_sheets = excel_matcher.build_index(excel_paths)
     logger.info("excel_matcher indexed %d sheet(s)", len(excel_sheets))
 
-    # -------- 4-9. fill each table independently --------
-    for ti in infos:
-        await _fill_one_table(
-            ti,
-            excel_sheets=excel_sheets,
-            md_txt_docs=md_txt_docs,
-            word_docs=word_docs,
-            md_txt_paths=md_txt_paths,
-            word_paths=word_paths,
-            requirement=requirement,
-        )
+    # -------- 4-9. fill each table independently (parallel when >1 table) --------
+    async def _safe_fill(ti: table_ops.TemplateInfo) -> None:
+        try:
+            await _fill_one_table(
+                ti,
+                excel_sheets=excel_sheets,
+                md_txt_docs=md_txt_docs,
+                word_docs=word_docs,
+                md_txt_paths=md_txt_paths,
+                word_paths=word_paths,
+                requirement=requirement,
+            )
+        except Exception:
+            logger.exception("table[%d] fill failed — skipping", ti.table_index)
+
+    if len(infos) == 1:
+        await _safe_fill(infos[0])
+    else:
+        await asyncio.gather(*[_safe_fill(ti) for ti in infos])
 
     # -------- 10. persist + return --------
     out_name = f"filled_{design_name}"
@@ -1087,7 +1231,689 @@ async def process(
         if kind == "word"
         else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+    _record_op("process", f"模板: {design_name}, 表数: {len(infos)}, 要求: {requirement[:60]}")
     return FileResponse(path=out_path, filename=out_name, media_type=media_type)
+
+
+# ---------------------------------------------------------------------------
+# File preview (for the frontend)
+# ---------------------------------------------------------------------------
+
+@app.get("/preview/{filename}", summary="Preview / download an ingested file")
+def preview_file(filename: str):
+    """Serve an ingested file so the frontend can preview it.
+
+    Guarded against path traversal: the resolved path must stay inside
+    :data:`_INGEST_DIR`.
+    """
+    # Reject obviously malicious names BEFORE touching the filesystem
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    safe_name = sanitize_filename(filename)
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+
+    fpath = (_INGEST_DIR / safe_name).resolve()
+    ingest_root = _INGEST_DIR.resolve()
+    try:
+        fpath.relative_to(ingest_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="路径越界")
+
+    if not fpath.exists() or not fpath.is_file():
+        raise HTTPException(status_code=404, detail=f"文件 {filename} 不存在")
+    # Basic MIME mapping
+    ext = fpath.suffix.lower()
+    _MIME = {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pdf": "application/pdf",
+        ".md": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+    }
+    return FileResponse(
+        path=str(fpath),
+        filename=filename,
+        media_type=_MIME.get(ext, "application/octet-stream"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Operation history
+# ---------------------------------------------------------------------------
+
+_OP_HISTORY: deque = deque(maxlen=200)  # ring buffer, newest last
+_OP_COUNTER = 0  # monotonic, never wraps even when ring buffer drops old entries
+
+
+def _record_op(op_type: str, detail: str, status: str = "ok") -> dict:
+    global _OP_COUNTER
+    _OP_COUNTER += 1
+    entry = {
+        "id": _OP_COUNTER,
+        "type": op_type,
+        "detail": detail,
+        "status": status,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _OP_HISTORY.append(entry)
+    return entry
+
+
+@app.get("/history", summary="Operation history (recent 200)")
+def get_history(limit: int = 50):
+    """Return the most recent operations for the frontend dashboard."""
+    items = list(_OP_HISTORY)
+    items.reverse()  # newest first
+    return {"history": items[:limit]}
+
+
+# ---------------------------------------------------------------------------
+# Module 2: Information Extraction
+# ---------------------------------------------------------------------------
+
+@app.post("/extract", summary="Extract structured info from an uploaded document")
+async def extract_info(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Document to extract from (.docx/.pdf/.xlsx/.md/.txt)"),
+    query: str = Form("", description="Optional: specify what to extract"),
+):
+    """Module-2 endpoint: upload a document, get structured entities/key-info back."""
+    temp_dir = tempfile.mkdtemp(prefix="orch_extract_")
+    background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
+
+    fname = sanitize_filename(file.filename or "document")
+    ext = os.path.splitext(fname)[1].lower()
+    supported = {".md", ".txt", ".docx", ".xlsx", ".xls", ".pdf"}
+    if ext not in supported:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型: {ext}。支持: {', '.join(sorted(supported))}",
+        )
+
+    fpath = os.path.join(temp_dir, fname)
+    with open(fpath, "wb") as f:
+        f.write(await file.read())
+
+    doc_text = read_document_text(fpath)
+    if not doc_text or not doc_text.strip():
+        raise HTTPException(status_code=400, detail="无法从文件中提取文本内容")
+
+    # Truncate to fit LLM context
+    doc_text = _truncate_docs(doc_text, limit=MAX_DOCS_CHARS_PER_CHANNEL)
+
+    prompt = llm.build_extract_prompt(doc_text, query)
+    try:
+        raw = await llm.chat(prompt, timeout=90.0)
+        result = llm.extract_json(raw)
+    except llm.LLMError as e:
+        logger.warning("extract LLM failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"信息提取失败: {e}")
+
+    if not isinstance(result, dict):
+        result = {"raw": result}
+
+    result["file_name"] = fname
+    result["file_type"] = ext.lstrip(".")
+    result["char_count"] = len(doc_text)
+    _record_op("extract", f"文件: {fname}, 类型: {ext}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Module 1: Document Intelligent Editing
+# ---------------------------------------------------------------------------
+
+def _describe_doc_structure(path: str) -> str:
+    """Build a concise structural description of a .docx for the LLM."""
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    doc = Document(path)
+    parts: List[str] = []
+    para_idx = 0
+    w_t = qn("w:t")
+    w_tr = qn("w:tr")
+    w_tc = qn("w:tc")
+
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            para_idx += 1
+            texts = child.findall(".//" + w_t)
+            text = "".join(t.text or "" for t in texts).strip()
+            if text:
+                preview = text[:80] + ("..." if len(text) > 80 else "")
+                # Detect heading level
+                pPr = child.find(qn("w:pPr"))
+                style = ""
+                if pPr is not None:
+                    pStyle = pPr.find(qn("w:pStyle"))
+                    if pStyle is not None:
+                        style = f" [style={pStyle.get(qn('w:val'), '')}]"
+                parts.append(f"  段落{para_idx}{style}: {preview}")
+        elif tag == "tbl":
+            rows = child.findall(".//" + w_tr)
+            first_row_cells = []
+            if rows:
+                for tc in rows[0].findall(".//" + w_tc):
+                    ts = tc.findall(".//" + w_t)
+                    first_row_cells.append("".join(t.text or "" for t in ts).strip())
+            parts.append(
+                f"  [表格: {len(rows)}行, 表头: {first_row_cells[:6]}]"
+            )
+
+    return f"共 {para_idx} 个段落:\n" + "\n".join(parts[:50])
+
+
+def _apply_edit_ops(path: str, ops: List[dict]) -> str:
+    """Apply a list of edit operations to a .docx and return the saved path."""
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document(path)
+    paragraphs = doc.paragraphs
+
+    _ALIGN_MAP = {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+    }
+
+    def _find_targets(target_desc: str) -> List[int]:
+        """Resolve a target description like '第1段' / '包含XXX的段落' / '所有段落'."""
+        desc = target_desc.strip()
+        if desc == "所有段落":
+            return list(range(len(paragraphs)))
+        # '第N段'
+        m = re.match(r"第(\d+)段", desc)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(paragraphs):
+                return [idx]
+            return []
+        # '标题' — first paragraph
+        if "标题" in desc:
+            return [0] if paragraphs else []
+        # '包含XXX的段落'
+        m2 = re.match(r"包含[\"']?(.+?)[\"']?的段落", desc)
+        keyword = m2.group(1) if m2 else desc
+        return [i for i, p in enumerate(paragraphs) if keyword in p.text]
+
+    for op in ops:
+        action = op.get("action", "")
+        target = op.get("target", "")
+        params = op.get("params", {})
+
+        try:
+            indices = _find_targets(target)
+
+            if action == "format_text":
+                for idx in indices:
+                    for run in paragraphs[idx].runs:
+                        if "bold" in params:
+                            run.bold = params["bold"]
+                        if "italic" in params:
+                            run.italic = params["italic"]
+                        if "underline" in params:
+                            run.underline = params["underline"]
+                        if "font_name" in params:
+                            run.font.name = params["font_name"]
+                        if "font_size" in params:
+                            run.font.size = Pt(params["font_size"])
+                        if "color" in params:
+                            hex_color = params["color"].lstrip("#")
+                            run.font.color.rgb = RGBColor(
+                                int(hex_color[0:2], 16),
+                                int(hex_color[2:4], 16),
+                                int(hex_color[4:6], 16),
+                            )
+
+            elif action == "set_alignment":
+                align = _ALIGN_MAP.get(params.get("alignment", ""), None)
+                if align is not None:
+                    for idx in indices:
+                        paragraphs[idx].alignment = align
+
+            elif action == "replace_text":
+                old = params.get("old", "")
+                new = params.get("new", "")
+                if old:
+                    for idx in indices:
+                        for run in paragraphs[idx].runs:
+                            if old in run.text:
+                                run.text = run.text.replace(old, new)
+
+            elif action == "insert_text":
+                position = params.get("position", "after")
+                text = params.get("text", "")
+                if text and indices:
+                    ref_idx = indices[0]
+                    ref_para = paragraphs[ref_idx]
+                    new_para = doc.add_paragraph(text)
+                    # Move the new paragraph to the right position
+                    if position == "before":
+                        ref_para._element.addprevious(new_para._element)
+                    else:
+                        ref_para._element.addnext(new_para._element)
+
+            elif action == "delete_text":
+                for idx in sorted(indices, reverse=True):
+                    p = paragraphs[idx]._element
+                    p.getparent().remove(p)
+
+            elif action == "set_heading":
+                level = params.get("level", 1)
+                for idx in indices:
+                    paragraphs[idx].style = doc.styles[f"Heading {level}"]
+
+            elif action == "insert_table":
+                rows = params.get("rows", 2)
+                cols = params.get("cols", 2)
+                headers = params.get("headers", [])
+                tbl = doc.add_table(rows=rows, cols=cols)
+                tbl.style = "Table Grid"
+                if headers:
+                    for ci, h in enumerate(headers[:cols]):
+                        tbl.rows[0].cells[ci].text = h
+                # Move table after target paragraph
+                if indices:
+                    paragraphs[indices[0]]._element.addnext(tbl._element)
+
+            elif action == "set_page_margin":
+                sections = doc.sections
+                for section in sections:
+                    if "top" in params:
+                        section.top_margin = Cm(params["top"])
+                    if "bottom" in params:
+                        section.bottom_margin = Cm(params["bottom"])
+                    if "left" in params:
+                        section.left_margin = Cm(params["left"])
+                    if "right" in params:
+                        section.right_margin = Cm(params["right"])
+
+            logger.info("doc-edit applied: action=%s target=%s", action, target)
+        except Exception as e:
+            logger.warning("doc-edit op failed: %s — %s", op, e)
+
+    base, ext = os.path.splitext(path)
+    out_path = f"{base}_edited{ext}"
+    doc.save(out_path)
+    return out_path
+
+
+@app.post("/doc-edit", summary="Edit a document via natural language instruction")
+async def doc_edit(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Word document (.docx)"),
+    instruction: str = Form(..., description="Natural language edit instruction"),
+):
+    """Module-1 endpoint: upload a .docx + a natural language instruction,
+    get the edited document back."""
+    if not instruction or not instruction.strip():
+        raise HTTPException(status_code=400, detail="请提供编辑指令")
+
+    temp_dir = tempfile.mkdtemp(prefix="orch_docedit_")
+    background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
+
+    fname = sanitize_filename(file.filename or "document.docx")
+    ext = os.path.splitext(fname)[1].lower()
+    if ext != ".docx":
+        raise HTTPException(status_code=400, detail="目前仅支持 .docx 格式")
+
+    fpath = os.path.join(temp_dir, fname)
+    with open(fpath, "wb") as f:
+        f.write(await file.read())
+
+    # 1. Describe the document structure for the LLM
+    try:
+        doc_structure = _describe_doc_structure(fpath)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"文档解析失败: {e}")
+
+    # 2. Ask LLM to parse the instruction into operations
+    prompt = llm.build_doc_edit_prompt(instruction, doc_structure)
+    try:
+        raw = await llm.chat(prompt, timeout=60.0)
+        ops = llm.extract_json(raw)
+    except llm.LLMError as e:
+        raise HTTPException(status_code=500, detail=f"指令解析失败: {e}")
+
+    if not isinstance(ops, list):
+        raise HTTPException(status_code=500, detail="LLM 返回的操作格式异常")
+
+    # 3. Apply the operations
+    try:
+        edited_path = _apply_edit_ops(fpath, ops)
+    except Exception as e:
+        logger.exception("doc-edit apply failed")
+        raise HTTPException(status_code=500, detail=f"文档编辑执行失败: {e}")
+
+    base, ext = os.path.splitext(fname)
+    out_name = f"{base}_edited{ext}"
+    _record_op("doc-edit", f"文件: {fname}, 指令: {instruction[:60]}")
+    return FileResponse(
+        path=edited_path,
+        filename=out_name,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat Agent (unified conversational entry point)
+# ---------------------------------------------------------------------------
+
+# Persistent (TTL-cleaned) storage for files generated during chat sessions.
+# Files live here until the next process restart OR until manually purged.
+_CHAT_RESULT_DIR = Path(tempfile.gettempdir()) / "modora_chat_results"
+_CHAT_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _store_chat_result(content: bytes, ext: str) -> str:
+    """Persist a result file and return its file_id."""
+    file_id = uuid.uuid4().hex
+    safe_ext = ext if ext.startswith(".") else f".{ext}"
+    fpath = _CHAT_RESULT_DIR / f"{file_id}{safe_ext}"
+    with open(fpath, "wb") as f:
+        f.write(content)
+    return file_id
+
+
+@app.get("/agent/chat/result/{file_id}", summary="Download a chat-generated file")
+def get_chat_result(file_id: str):
+    """Serve a file produced by the chat agent. Guarded against path traversal."""
+    if not re.fullmatch(r"[a-f0-9]{32}", file_id):
+        raise HTTPException(status_code=400, detail="非法 file_id")
+    matches = list(_CHAT_RESULT_DIR.glob(f"{file_id}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="结果文件不存在或已过期")
+    fpath = matches[0]
+    ext = fpath.suffix.lower()
+    _MIME = {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pdf": "application/pdf",
+        ".json": "application/json",
+        ".txt": "text/plain; charset=utf-8",
+    }
+    return FileResponse(
+        path=str(fpath),
+        filename=fpath.name,
+        media_type=_MIME.get(ext, "application/octet-stream"),
+    )
+
+
+async def _classify_chat_intent(
+    user_message: str,
+    file_names: List[str],
+) -> str:
+    """LLM-driven intent classification. Falls back to keyword heuristics."""
+    try:
+        prompt = llm.build_intent_prompt(user_message, bool(file_names), file_names)
+        raw = await llm.chat(prompt, timeout=30.0)
+        parsed = llm.extract_json(raw)
+        if isinstance(parsed, dict):
+            intent = parsed.get("intent", "chat")
+            if intent in {"doc_edit", "extract", "fill_table", "chat"}:
+                return intent
+    except Exception as e:
+        logger.warning("intent classification failed, using heuristic: %s", e)
+    # Heuristic fallback
+    msg = user_message.lower()
+    if any(kw in user_message for kw in ["加粗", "字体", "对齐", "排版", "标题", "缩进", "颜色", "插入", "替换"]):
+        return "doc_edit"
+    if any(kw in user_message for kw in ["提取", "实体", "关键信息", "摘要", "总结"]):
+        return "extract"
+    if any(kw in user_message for kw in ["填表", "填写", "模板", "表格"]):
+        return "fill_table"
+    return "chat"
+
+
+@app.post("/agent/chat", summary="Unified conversational entry point")
+async def agent_chat(
+    background_tasks: BackgroundTasks,
+    message: str = Form(..., description="User's current message"),
+    history: str = Form("[]", description="JSON array of prior {role, content}"),
+    files: List[UploadFile] = File(default=[], description="Attached files for this turn"),
+):
+    """Conversational dispatcher. Routes to the right module based on intent."""
+    # 1. Save attached files to a per-request tempdir (cleaned after response)
+    temp_dir = tempfile.mkdtemp(prefix="orch_chat_")
+    background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
+
+    saved: List[tuple] = []  # (filename, fpath)
+    for f in files:
+        if not f or not f.filename:
+            continue
+        name = sanitize_filename(f.filename)
+        fpath = os.path.join(temp_dir, name)
+        with open(fpath, "wb") as out:
+            out.write(await f.read())
+        saved.append((name, fpath))
+
+    file_names = [n for n, _ in saved]
+
+    # 2. Classify intent
+    intent = await _classify_chat_intent(message, file_names)
+    logger.info("agent.chat intent=%s files=%s", intent, file_names)
+
+    # 3. Dispatch
+    try:
+        if intent == "doc_edit":
+            return await _handle_chat_doc_edit(message, saved)
+        if intent == "extract":
+            return await _handle_chat_extract(message, saved)
+        if intent == "fill_table":
+            return _handle_chat_fill_table_redirect()
+        # chat: free-form conversation
+        return await _handle_chat_general(message, history, saved)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("agent.chat dispatch failed")
+        return {
+            "role": "assistant",
+            "intent": intent,
+            "content": f"很抱歉，处理时出错了: {e}",
+            "result": None,
+        }
+
+
+# --- Per-intent handlers --------------------------------------------------
+
+async def _handle_chat_doc_edit(user_message: str, saved: List[tuple]) -> dict:
+    docx_files = [(n, p) for n, p in saved if n.lower().endswith(".docx")]
+    if not docx_files:
+        return {
+            "role": "assistant",
+            "intent": "doc_edit",
+            "content": "我可以帮你编辑 Word 文档。请把需要编辑的 .docx 文件附在消息里再发送一次。",
+            "result": None,
+        }
+
+    name, fpath = docx_files[0]
+    try:
+        doc_structure = _describe_doc_structure(fpath)
+    except Exception as e:
+        return {
+            "role": "assistant",
+            "intent": "doc_edit",
+            "content": f"无法解析文档结构: {e}",
+            "result": None,
+        }
+
+    prompt = llm.build_doc_edit_prompt(user_message, doc_structure)
+    try:
+        raw = await llm.chat(prompt, timeout=60.0)
+        ops = llm.extract_json(raw)
+    except llm.LLMError as e:
+        return {
+            "role": "assistant",
+            "intent": "doc_edit",
+            "content": f"无法解析您的指令: {e}",
+            "result": None,
+        }
+    if not isinstance(ops, list):
+        return {
+            "role": "assistant",
+            "intent": "doc_edit",
+            "content": "LLM 返回了不期望的格式，请重述指令。",
+            "result": None,
+        }
+
+    edited_path = _apply_edit_ops(fpath, ops)
+    with open(edited_path, "rb") as f:
+        content = f.read()
+    base, ext = os.path.splitext(name)
+    file_id = _store_chat_result(content, ext)
+    out_name = f"{base}_edited{ext}"
+
+    _record_op("agent.doc-edit", f"{name}: {user_message[:50]}")
+    return {
+        "role": "assistant",
+        "intent": "doc_edit",
+        "content": f"已对《{name}》执行 {len(ops)} 个编辑操作，点击下方下载。",
+        "result": {
+            "type": "file_download",
+            "file_id": file_id,
+            "filename": out_name,
+            "size": len(content),
+            "operations": ops,
+        },
+    }
+
+
+async def _handle_chat_extract(user_message: str, saved: List[tuple]) -> dict:
+    if not saved:
+        return {
+            "role": "assistant",
+            "intent": "extract",
+            "content": "请先上传一份文档（.docx / .pdf / .xlsx / .md / .txt），我帮你提取关键信息。",
+            "result": None,
+        }
+
+    name, fpath = saved[0]
+    ext = os.path.splitext(name)[1].lower()
+    supported = {".md", ".txt", ".docx", ".xlsx", ".xls", ".pdf"}
+    if ext not in supported:
+        return {
+            "role": "assistant",
+            "intent": "extract",
+            "content": f"暂不支持 {ext} 格式。支持: {', '.join(sorted(supported))}",
+            "result": None,
+        }
+
+    doc_text = read_document_text(fpath)
+    if not doc_text or not doc_text.strip():
+        return {
+            "role": "assistant",
+            "intent": "extract",
+            "content": f"无法从《{name}》中读取文本，可能是扫描件或加密文档。",
+            "result": None,
+        }
+    doc_text = _truncate_docs(doc_text, limit=MAX_DOCS_CHARS_PER_CHANNEL)
+
+    prompt = llm.build_extract_prompt(doc_text, user_message)
+    try:
+        raw = await llm.chat(prompt, timeout=90.0)
+        result = llm.extract_json(raw)
+    except llm.LLMError as e:
+        return {
+            "role": "assistant",
+            "intent": "extract",
+            "content": f"信息提取失败: {e}",
+            "result": None,
+        }
+    if not isinstance(result, dict):
+        result = {"raw": result}
+
+    n_ent = len(result.get("entities") or [])
+    n_keys = len(result.get("key_info") or {})
+    summary_preview = (result.get("summary") or "").strip()
+    reply = f"已从《{name}》提取出 {n_ent} 个实体、{n_keys} 个关键信息字段。"
+    if summary_preview:
+        reply += f"\n\n**摘要**: {summary_preview[:200]}"
+
+    _record_op("agent.extract", f"{name}: {user_message[:50]}")
+    return {
+        "role": "assistant",
+        "intent": "extract",
+        "content": reply,
+        "result": {
+            "type": "extract_data",
+            "filename": name,
+            "data": result,
+        },
+    }
+
+
+def _handle_chat_fill_table_redirect() -> dict:
+    return {
+        "role": "assistant",
+        "intent": "fill_table",
+        "content": (
+            "表格智能填写需要协调多份素材文件（Excel/Word/MD），"
+            "聊天模式难以一次完成。请打开侧栏的"
+            "「专家模式 → 表格智能填写」，按引导分步上传素材和模板。"
+        ),
+        "result": {
+            "type": "redirect",
+            "url": "/table-fill",
+            "label": "去表格填写页",
+        },
+    }
+
+
+async def _handle_chat_general(
+    user_message: str,
+    history_json: str,
+    saved: List[tuple],
+) -> dict:
+    """Free-form chat. If files are attached, mention their content briefly."""
+    try:
+        history = json.loads(history_json) if history_json else []
+    except (json.JSONDecodeError, TypeError):
+        history = []
+
+    file_context = ""
+    if saved:
+        snippets = []
+        for name, fpath in saved[:3]:
+            text = read_document_text(fpath)
+            if text:
+                snippets.append(f"=== {name} (前 1500 字) ===\n{text[:1500]}")
+        if snippets:
+            file_context = "\n\n【附带文档内容】\n" + "\n\n".join(snippets) + "\n"
+
+    history_text = ""
+    if history:
+        history_text = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')[:300]}"
+            for m in history[-6:]
+        )
+        history_text = f"\n\n【对话历史】\n{history_text}\n"
+
+    prompt = (
+        "你是 MoDora 智能文档助手。请用中文友好回答用户问题。"
+        "如果用户附带了文档，请基于文档内容回答；如果没有，按通用知识回答。"
+        "回答控制在 200 字以内，简洁清晰。\n"
+        f"{history_text}"
+        f"{file_context}\n"
+        f"用户当前消息: {user_message}\n"
+    )
+    try:
+        reply = await llm.chat(prompt, timeout=60.0)
+    except llm.LLMError as e:
+        reply = f"暂时无法回复: {e}"
+
+    return {
+        "role": "assistant",
+        "intent": "chat",
+        "content": reply.strip(),
+        "result": None,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@
 |------|---------|---------|------|
 | **Git** | ≥ 2.40 | https://git-scm.com/download/win | 安装时全选默认即可 |
 | **Python** | **3.10 – 3.12**（推荐 3.11） | https://www.python.org/downloads/ | ⚠️ 安装时**必须勾选** "Add Python to PATH" |
+| **Node.js** | **^20.19.0 或 ≥22.12.0** | https://nodejs.org/ | 前端开发服务器需要 |
 | **LibreOffice** | ≥ 7.6 | https://www.libreoffice.org/download/ | 用于 docx/txt/md → PDF 转换 |
 
 ### 怎么验证装好了
@@ -21,6 +22,8 @@
 ```powershell
 git --version          # 应显示 git version 2.xx.x
 python --version       # 应显示 Python 3.10.x / 3.11.x / 3.12.x
+node --version         # 应显示 v20.x.x 或 v22.x.x
+npm --version          # 应显示 10.x.x 或更高
 ```
 
 如果 `python` 没反应但 `python3` 可以，后续所有命令把 `python` 换成 `python3`。
@@ -144,9 +147,9 @@ All offline smoke tests PASSED.
 
 ## 五、启动服务
 
-需要开 **三个** PowerShell 窗口（都要先 `cd` 到项目目录 + 激活虚拟环境）。
+需要开 **四个** PowerShell 窗口。
 
-> 每个窗口都先执行：
+> 窗口 1–3 都要先激活虚拟环境：
 > ```powershell
 > cd D:\MoDora-orchestrator      # 换成你的项目路径
 > .\.venv\Scripts\Activate.ps1
@@ -177,6 +180,32 @@ python -m uvicorn orchestrator.service:app --host 127.0.0.1 --port 8888 --reload
 
 > **如果你有真正的 MoDora 后端**，就不需要窗口 1 和 2，直接在 `.env` 里把
 > `BACKEND_MD_TXT_URL` 和 `BACKEND_WORD_URL` 指向真实 MoDora 的地址即可。
+
+### 窗口 4：前端开发服务器（端口 5173）
+
+```powershell
+cd frontend
+npm install        # 首次或依赖有变时执行
+npm run dev
+```
+
+看到 `Local: http://localhost:5173/` 就说明启动成功了。
+打开浏览器访问 http://localhost:5173 即可使用前端界面。
+
+> 前端通过 Vite proxy 把 `/api/*` 请求转发到 `http://127.0.0.1:8888`，
+> 所以 **orchestrator 必须先启动**，否则前端页面会显示"后端未连接"。
+
+### 前端页面说明
+
+| 页面 | 路由 | 功能 |
+|------|------|------|
+| **工作台** | `/workspace` | 首页，展示实时统计、最近任务、CCTree 状态 |
+| **智能对话** | `/chat` | 统一对话入口，自动路由到文档编辑/信息提取/表格填写 |
+| **素材库** | `/library` | 查看已入库素材，按通道分类（Excel/Word/MD） |
+| **表格填写** | `/table-fill` | 三步流程：上传素材 → 上传模板 → 生成结果 |
+| **信息提取** | `/extract` | 上传文档，提取实体/摘要/关键信息 |
+| **文档编辑** | `/doc-edit` | 用自然语言编辑 Word 文档 |
+| **运行状态** | `/dashboard` | 后端健康检查、操作历史 |
 
 ### 验证服务正常
 
@@ -622,8 +651,9 @@ python -m orchestrator._smoke_offline
 MoDora-orchestrator/
 ├── .env.example          ← 环境变量模板，复制成 .env
 ├── MISSION.md            ← 项目总目标（中英双语），有空读一遍
-├── orchestrator/         ← 我们写的编排层，核心代码都在这
-│   ├── service.py        ← FastAPI 主服务（/ingest, /process, /health）
+├── TEAMMATE_GUIDE.md     ← 就是你正在读的这个文档
+├── orchestrator/         ← 编排层（Python FastAPI，端口 8888）
+│   ├── service.py        ← 主服务：/health /ingest /process /extract /doc-edit /agent/chat
 │   ├── llm.py            ← DashScope LLM 调用 + 自动重试
 │   ├── excel_matcher.py  ← Excel 表头匹配（不走 LLM）
 │   ├── table_ops.py      ← 读写 docx/xlsx 模板
@@ -632,12 +662,23 @@ MoDora-orchestrator/
 │   ├── mock_modora.py    ← MoDora 模拟服务（测试用）
 │   ├── _smoke_offline.py ← 离线测试
 │   └── requirements.txt  ← Python 依赖
-├── MoDora-backend/       ← MoDora 原始后端（不要改）
-└── MoDora-frontend/      ← MoDora 前端（不要改）
+├── frontend/             ← React 前端（Vite + TailwindCSS，端口 5173）
+│   ├── src/
+│   │   ├── pages/        ← 7 个页面：Workspace Chat Library TableFill Extract DocEdit Dashboard
+│   │   ├── components/   ← 共享 UI 组件（TopNav Sidebar Card Button Badge 等）
+│   │   └── lib/api.js    ← 前端 API 客户端（对接 orchestrator 全部 endpoint）
+│   ├── package.json
+│   └── vite.config.js    ← 开发代理：/api/* → 127.0.0.1:8888
+├── MoDora-backend/       ← MoDora CCTree 核心（可优化，谨慎修改）
+├── MoDora-frontend/      ← MoDora 原始前端（已被 frontend/ 替代，保留做参考）
+├── testData/             ← 竞赛测试用例（TC1~TC3）
+└── docs/prototypes/      ← UI 原型 HTML
 ```
 
-**关键原则**：`MoDora-backend/` 和 `MoDora-frontend/` 里的东西**绝对不要改**，
-我们只改 `orchestrator/` 里的代码。
+**关键原则**：
+- `orchestrator/` 和 `frontend/` 是我们的主战场，随意改
+- `MoDora-backend/` 可以做性能/准确率优化，但要**谨慎修改**，改前知会一声
+- `MoDora-frontend/` 已被 `frontend/` 替代，仅保留做参考
 
 ---
 
