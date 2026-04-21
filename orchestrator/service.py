@@ -179,17 +179,47 @@ def _normalize_entity(s: str) -> str:
     return re.sub(r"\s+", "", str(s).strip())
 
 
+# Trailing Chinese administrative-division suffixes. Used ONLY to build dedup
+# keys — the original value is preserved for display. The regex intentionally
+# anchors to the end of the string (``$``) to avoid mangling names like
+# "内蒙古自治区包头市" where "自治区" is *not* the terminal suffix.
+_ADMIN_SUFFIX_RE = re.compile(
+    r"(特别行政区|自治区|自治州|自治县|自治旗|省|市|区|县|镇|乡|旗)+$"
+)
+
+
+def _dedupe_key(s: str) -> str:
+    """Normalised key for entity deduplication across channels.
+
+    On top of :func:`_normalize_entity`, strips trailing admin-division
+    suffixes so "合肥" and "合肥市" collapse to the same bucket. If stripping
+    the suffix would leave an empty string (i.e. the value *is* just "市"),
+    we keep the un-stripped form so we don't collapse every bare-suffix cell
+    into a single empty key.
+    """
+    norm = _normalize_entity(s)
+    stripped = _ADMIN_SUFFIX_RE.sub("", norm)
+    return stripped if stripped else norm
+
+
 def _dedupe_entity_rows(rows: List[List[str]]) -> List[List[str]]:
-    """De-duplicate entity rows across channels preserving first-seen order."""
+    """De-duplicate entity rows across channels preserving first-seen order.
+
+    Key equality uses :func:`_dedupe_key` so ``["合肥市"]`` (from Excel) and
+    ``["合肥"]`` (from an md document) are recognised as the same entity; the
+    first-seen row wins, which in practice means Excel's well-formed value
+    displaces MoDora's truncated one because Excel rows come first in the
+    merge order.
+    """
     seen = set()
     out: List[List[str]] = []
     for row in rows:
-        norm = tuple(_normalize_entity(v) for v in row)
-        if not any(norm):
+        key = tuple(_dedupe_key(v) for v in row)
+        if not any(key):
             continue
-        if norm in seen:
+        if key in seen:
             continue
-        seen.add(norm)
+        seen.add(key)
         out.append([str(v).strip() for v in row])
     return out
 
@@ -204,6 +234,7 @@ def _truncate_docs(text: str, limit: int = MAX_DOCS_CHARS_PER_CHANNEL) -> str:
 def _concat_channel_texts(
     file_paths: List[str],
     limit: int = MAX_DOCS_CHARS_PER_CHANNEL,
+    text_cache: Optional[Dict[str, str]] = None,
 ) -> str:
     """Join up to ``limit`` chars of text across all files in the channel.
 
@@ -216,11 +247,22 @@ def _concat_channel_texts(
 
     Small files stay whole; a pathologically long file (say the only file in
     the channel) still enjoys the full budget.
+
+    If ``text_cache`` is provided, file reads are memoised in it (G9). The
+    first call for a given path populates the cache; subsequent calls within
+    the same /process reuse the stored string. Passing ``None`` preserves the
+    legacy behaviour of reading from disk every time (used by tests and
+    endpoints that only look at one file).
     """
     # Gather (filename, full_text) pairs, discarding files that produced no text.
     sources: List[tuple] = []
     for p in file_paths:
-        text = read_document_text(p)
+        if text_cache is not None and p in text_cache:
+            text = text_cache[p]
+        else:
+            text = read_document_text(p)
+            if text_cache is not None:
+                text_cache[p] = text or ""
         if text:
             sources.append((os.path.basename(p), text))
     if not sources:
@@ -279,16 +321,52 @@ async def _detect_structure(context: str, headers: List[str], requirement: str):
                 attempt + 1, e,
             )
 
-    # Heuristic fallback helper
-    _PARENT_KW = {"名", "区", "省", "市", "国", "编号", "代码", "站点", "编码", "序号", "排名"}
+    # Heuristic fallback. Two keyword sets so we can resolve conflicts
+    # deterministically: if a header matches BOTH a parent and a child cue
+    # (unusual, but e.g. "站点总数" hits 站点 from _PARENT_KW and 总数 from
+    # _CHILD_KW), _CHILD_KW wins because measurement-like words almost
+    # always indicate a value column in the contest corpus.
+    _PARENT_KW = {
+        # 地理 / 行政
+        "名", "区", "省", "市", "国", "县", "镇", "乡", "街道",
+        # 标识符
+        "编号", "代码", "编码", "站点", "序号", "排名", "id",
+        # 人 / 组织
+        "姓名", "公司", "机构", "单位", "部门",
+        # 时间类(常作为时间序列主键)
+        "日期", "时间", "年月", "年份", "月份", "期号", "期",
+    }
+    _CHILD_KW = {
+        # 核心度量
+        "gdp", "产值", "产量", "人口", "面积", "售价", "价格", "金额",
+        "收入", "支出", "利润", "营收", "预算",
+        # 统计
+        "总数", "总量", "数量", "人数", "次数", "数目",
+        "率", "比例", "占比", "指数", "指标",
+        # 空气 / 气象 / 环境
+        "aqi", "pm2.5", "pm10", "降雨量", "温度", "湿度", "浓度",
+        # 健康 / 疫情
+        "确诊", "治愈", "死亡", "检测", "病例",
+    }
 
     def _heuristic() -> tuple:
         logger.warning("structure detection: using heuristic fallback")
-        pc = [i for i, h in enumerate(headers) if any(kw in h for kw in _PARENT_KW)]
-        cc = [i for i in range(len(headers)) if i not in pc]
+        pc: List[int] = []
+        cc: List[int] = []
+        for i, h in enumerate(headers):
+            h_low = h.lower()
+            is_child = any(kw in h_low for kw in _CHILD_KW)
+            is_parent = any(kw in h_low for kw in _PARENT_KW)
+            if is_child:
+                cc.append(i)
+            elif is_parent:
+                pc.append(i)
+            else:
+                cc.append(i)  # unknown → default to child (safer: LLM will be queried)
         if not pc:
+            # Nothing looked parent-ish → fall back to "first column is the key"
             pc = [0]
-            cc = list(range(1, len(headers)))
+            cc = [i for i in range(len(headers)) if i != 0]
         return pc, cc
 
     if parsed is None:
@@ -308,6 +386,7 @@ async def _extract_parent_entities_for_channel(
     parent_headers: List[str],
     child_headers: List[str],
     requirement: str,
+    text_cache: Optional[Dict[str, str]] = None,
 ) -> List[List[str]]:
     """Ask the LLM for parent-entity rows; return [] only after real exhaustion.
 
@@ -317,7 +396,7 @@ async def _extract_parent_entities_for_channel(
     """
     if not file_paths:
         return []
-    docs_text = _concat_channel_texts(file_paths)
+    docs_text = _concat_channel_texts(file_paths, text_cache=text_cache)
     if not docs_text:
         return []
     prompt = llm.build_entities_prompt(
@@ -343,6 +422,65 @@ async def _extract_parent_entities_for_channel(
     return [[str(x) for x in row] for row in parsed if isinstance(row, list)]
 
 
+_ROUTE_TOKEN_SPLIT_RE = re.compile(r"[\s,。;、/()【】\[\]（）<>]+")
+
+
+def _keyword_route_fallback(
+    ready: List[ingest_registry.IngestedDoc],
+    briefs: List[tuple],
+    parent_rows: List[List[str]],
+    child_headers: List[str],
+    requirement: str,
+    top_k: int,
+) -> List[ingest_registry.IngestedDoc]:
+    """Pick ``top_k`` docs by keyword overlap in filename + brief.
+
+    Used when LLM routing fails. Weighs hits in descending importance:
+      - parent-row values (the entities we actually need to answer)  × 3
+      - child-column headers (the metrics we're asking about)        × 1.5
+      - requirement tokens (date range, region, topic qualifier)     × 1
+
+    If zero docs score positively, returns ``ready`` untouched — that means
+    we genuinely have nothing better than "try everything" and the LLM
+    fallback was doing the right thing in the first place.
+    """
+    parent_kw: set = set()
+    for row in parent_rows:
+        for v in row:
+            vs = str(v).strip().lower()
+            if len(vs) >= 2:
+                parent_kw.add(vs)
+    child_kw = {h.strip().lower() for h in child_headers if h.strip()}
+    req_kw: set = set()
+    if requirement:
+        for tok in _ROUTE_TOKEN_SPLIT_RE.split(requirement):
+            tok = tok.strip().lower()
+            if len(tok) >= 2 and not tok.isdigit():
+                req_kw.add(tok)
+
+    scored: List[tuple] = []  # (score, idx)
+    for i, (fn, brief) in enumerate(briefs):
+        haystack = f"{fn}\n{brief}".lower()
+        score = 0.0
+        for kw in parent_kw:
+            if kw in haystack:
+                score += 3.0
+        for kw in child_kw:
+            if kw in haystack:
+                score += 1.5
+        for kw in req_kw:
+            if kw in haystack:
+                score += 1.0
+        scored.append((score, i))
+
+    positive = [i for s, i in sorted(scored, key=lambda x: x[0], reverse=True) if s > 0]
+    if not positive:
+        # No hits at all → keyword match didn't help; let caller keep full list.
+        return ready
+    keep = positive[:top_k]
+    return [ready[i] for i in sorted(keep)]
+
+
 async def _route_channel_files(
     docs: List[ingest_registry.IngestedDoc],
     parent_headers: List[str],
@@ -350,12 +488,14 @@ async def _route_channel_files(
     parent_rows: List[List[str]],
     requirement: str,
     top_k: int = _ROUTE_TOP_K,
+    text_cache: Optional[Dict[str, str]] = None,
 ) -> List[ingest_registry.IngestedDoc]:
     """Shrink a channel's file list to the ``top_k`` most relevant ones.
 
     Guarantees this function upholds:
     - **Never drops all docs.** If the LLM returns garbage, a list with
-      unusable indices, or raises, we fall back to ``ready`` untouched.
+      unusable indices, or raises, we fall back to keyword routing; if THAT
+      also yields nothing we fall back to ``ready`` untouched.
     - **No-ops for small cohorts.** If the channel already has ≤ ``top_k``
       ready docs, routing would only add latency; we skip straight through.
     - **Only MoDora-ready docs are eligible.** A doc whose PDF build failed
@@ -375,41 +515,114 @@ async def _route_channel_files(
 
     briefs: List[tuple] = []
     for d in ready:
-        try:
-            text = read_document_text(d.local_path)
-        except Exception:
-            logger.warning("route: failed to read %s; using filename only", d.local_path)
-            text = ""
+        # Reuse the cached text when available; fall back to fresh disk read
+        # so direct callers (tests, /extract) that don't pass a cache still
+        # work.
+        cached = text_cache.get(d.local_path) if text_cache is not None else None
+        if cached is not None:
+            text = cached
+        else:
+            try:
+                text = read_document_text(d.local_path)
+            except Exception:
+                logger.warning("route: failed to read %s; using filename only", d.local_path)
+                text = ""
+            if text_cache is not None:
+                text_cache[d.local_path] = text or ""
         briefs.append((d.original_name, text[:_ROUTE_BRIEF_CHARS]))
 
+    # G3: keyword prefilter BEFORE LLM routing. If parent entities clearly
+    # disqualify some files (no mention of any entity in filename + brief
+    # prefix), drop them from the candidate pool up-front. Two benefits:
+    #   1. Smaller candidate list → LLM has an easier job choosing top-k.
+    #   2. When prefilter alone narrows to ≤ top_k docs, we skip the LLM
+    #      round-trip entirely.
+    # We disable the prefilter whenever it would be too aggressive (fewer
+    # than top_k hits) because losing a relevant doc is strictly worse than
+    # letting the LLM see a few irrelevant ones.
+    parent_kw: set = set()
+    for row in parent_rows:
+        for v in row:
+            vs = str(v).strip().lower()
+            if len(vs) >= 2:
+                parent_kw.add(vs)
+
+    prefilter_hits: Optional[List[int]] = None
+    if parent_kw:
+        hits = [
+            i for i, (fn, brief) in enumerate(briefs)
+            if any(kw in f"{fn}\n{brief}".lower() for kw in parent_kw)
+        ]
+        if len(hits) >= top_k:
+            # Only trust the prefilter when it leaves enough room for LLM
+            # ranking; otherwise we risk losing the actual answer doc.
+            prefilter_hits = hits
+
+    if prefilter_hits is not None and len(prefilter_hits) == top_k:
+        # Perfect match: exactly top_k parent-hit candidates. Skip the LLM.
+        selected = [ready[i] for i in prefilter_hits]
+        logger.info(
+            "route: keyword prefilter alone kept %d/%d files (no LLM call): %s",
+            len(selected), len(ready),
+            [d.original_name for d in selected],
+        )
+        return selected
+
+    # Candidate pool for LLM routing: either the prefilter hits or the full
+    # ready list when prefilter was skipped.
+    if prefilter_hits is not None and len(prefilter_hits) < len(ready):
+        candidate_indices = prefilter_hits
+        candidate_briefs = [briefs[i] for i in candidate_indices]
+        logger.info(
+            "route: keyword prefilter narrowed candidates %d -> %d for LLM",
+            len(ready), len(candidate_indices),
+        )
+    else:
+        candidate_indices = list(range(len(ready)))
+        candidate_briefs = briefs
+
+    def _keyword_fallback(reason: str) -> List[ingest_registry.IngestedDoc]:
+        kw_selected = _keyword_route_fallback(
+            ready, briefs, parent_rows, child_headers, requirement, top_k,
+        )
+        if kw_selected is not ready and len(kw_selected) < len(ready):
+            logger.warning(
+                "route: %s — keyword fallback kept %d/%d files: %s",
+                reason, len(kw_selected), len(ready),
+                [d.original_name for d in kw_selected],
+            )
+            return kw_selected
+        logger.warning(
+            "route: %s — keyword fallback yielded no hits, keeping all %d files",
+            reason, len(ready),
+        )
+        return ready
+
     prompt = llm.build_route_prompt(
-        requirement, parent_headers, child_headers, parent_rows, briefs, top_k,
+        requirement, parent_headers, child_headers, parent_rows,
+        candidate_briefs, top_k,
     )
     try:
         raw = await llm.chat(prompt, timeout=45.0)
         parsed = llm.extract_json(raw)
     except llm.LLMError:
-        logger.warning(
-            "route: LLM routing failed for channel (n=%d) — falling back to all files",
-            len(ready),
-        )
-        return ready
+        return _keyword_fallback(f"LLM routing failed (n={len(candidate_briefs)})")
 
     if not isinstance(parsed, list) or not parsed:
-        logger.warning("route: non-list or empty selection %r — falling back", parsed)
-        return ready
+        return _keyword_fallback(f"non-list or empty selection {parsed!r}")
 
+    # LLM indices point into candidate_briefs, not ready. Remap through
+    # candidate_indices so we always return ready-space selections.
     indices: set = set()
     for i in parsed:
         try:
-            idx = int(i)
+            local_idx = int(i)
         except (TypeError, ValueError):
             continue
-        if 0 <= idx < len(ready):
-            indices.add(idx)
+        if 0 <= local_idx < len(candidate_indices):
+            indices.add(candidate_indices[local_idx])
     if not indices:
-        logger.warning("route: selection had no valid indices — falling back")
-        return ready
+        return _keyword_fallback("selection had no valid indices")
 
     selected = [ready[i] for i in sorted(indices)]
     logger.info(
@@ -584,11 +797,19 @@ def health():
 
 
 def _clean_ingest_dir() -> None:
-    """Wipe everything under :data:`_INGEST_DIR` between /ingest calls."""
+    """Wipe everything under :data:`_INGEST_DIR` between /ingest calls.
+
+    We skip ``registry.sqlite3*`` files (db, -wal, -shm) because they may
+    still be held open by the sqlite driver — removing them on Windows
+    raises PermissionError (WinError 32). The registry data has already
+    been cleared via :func:`ingest_registry.clear`.
+    """
     if not _INGEST_DIR.exists():
         _INGEST_DIR.mkdir(parents=True, exist_ok=True)
         return
     for child in _INGEST_DIR.iterdir():
+        if child.name.startswith("registry.sqlite3"):
+            continue
         try:
             if child.is_file() or child.is_symlink():
                 child.unlink()
@@ -709,6 +930,7 @@ async def _batch_extract_child_column(
     word_paths: List[str],
     requirement: str,
     context: str,
+    text_cache: Optional[Dict[str, str]] = None,
 ) -> List[Optional[str]]:
     """Extract *child_header* for all *rows_to_query* via ONE LLM call.
 
@@ -722,7 +944,9 @@ async def _batch_extract_child_column(
     if not all_paths or not rows_to_query:
         return [None] * len(rows_to_query)
 
-    docs_text = _concat_channel_texts(all_paths, limit=MAX_DOCS_CHARS_PER_CHANNEL)
+    docs_text = _concat_channel_texts(
+        all_paths, limit=MAX_DOCS_CHARS_PER_CHANNEL, text_cache=text_cache,
+    )
     if not docs_text.strip():
         return [None] * len(rows_to_query)
 
@@ -781,6 +1005,7 @@ async def _batch_extract_children_multi(
     word_paths: List[str],
     requirement: str,
     context: str,
+    text_cache: Optional[Dict[str, str]] = None,
 ) -> Dict[str, List[Optional[str]]]:
     """Extract **all** *child_headers* for **all** rows in ONE LLM call.
 
@@ -795,7 +1020,9 @@ async def _batch_extract_children_multi(
     if not all_paths or not rows_to_query or not child_headers:
         return empty
 
-    docs_text = _concat_channel_texts(all_paths, limit=MAX_DOCS_CHARS_PER_CHANNEL)
+    docs_text = _concat_channel_texts(
+        all_paths, limit=MAX_DOCS_CHARS_PER_CHANNEL, text_cache=text_cache,
+    )
     if not docs_text.strip():
         return empty
 
@@ -859,6 +1086,7 @@ async def _batch_extract_children_multi(
             _batch_extract_child_column(
                 h, parent_headers, rows_to_query,
                 md_txt_paths, word_paths, requirement, context,
+                text_cache=text_cache,
             )
             for h in child_headers
         ])
@@ -932,6 +1160,8 @@ async def _fill_one_table(
     md_txt_paths: List[str],
     word_paths: List[str],
     requirement: str,
+    channel_health: Optional[Dict[str, bool]] = None,
+    text_cache: Optional[Dict[str, str]] = None,
 ) -> None:
     """Run the full fill pipeline (steps 4-9) for **one** table.
 
@@ -973,18 +1203,38 @@ async def _fill_one_table(
     all_rows: List[List[str]] = []
     if parent_cols:
         excel_rows = excel_matcher.extract_parent_entities(filtered_sheets, parent_headers)
-        modora_rows = await asyncio.gather(
-            _extract_parent_entities_for_channel(
-                md_txt_paths, context, parent_headers, child_headers, requirement,
-            ),
-            _extract_parent_entities_for_channel(
-                word_paths, context, parent_headers, child_headers, requirement,
-            ),
-        )
-        all_rows.extend(excel_rows)
-        for rows in modora_rows:
-            all_rows.extend(rows)
-        all_rows = _dedupe_entity_rows(all_rows)
+        # G6: Excel is structured and authoritative. When it yields enough
+        # parent rows we skip the MoDora LLM extraction entirely — that path
+        # costs 2 LLM round-trips AND is the main source of hallucinated
+        # entities (e.g. LLM inventing an extra city that isn't really in
+        # the docs). ``ORCH_ENTITY_EXTRACT_EXCEL_MIN`` lets operators tune
+        # how much we trust Excel; set it very high (e.g. 10_000) to force
+        # the legacy always-run behaviour, or 1 (default) to skip whenever
+        # Excel provides any rows at all.
+        excel_min = int(os.environ.get("ORCH_ENTITY_EXTRACT_EXCEL_MIN", "1"))
+        skip_modora_entities = bool(excel_rows) and len(excel_rows) >= excel_min
+        if skip_modora_entities:
+            logger.info(
+                "table[%d] entity extraction: excel yielded %d rows (>= %d), "
+                "skipping MoDora LLM extraction",
+                tidx, len(excel_rows), excel_min,
+            )
+            all_rows = list(excel_rows)
+        else:
+            modora_rows = await asyncio.gather(
+                _extract_parent_entities_for_channel(
+                    md_txt_paths, context, parent_headers, child_headers, requirement,
+                    text_cache=text_cache,
+                ),
+                _extract_parent_entities_for_channel(
+                    word_paths, context, parent_headers, child_headers, requirement,
+                    text_cache=text_cache,
+                ),
+            )
+            all_rows.extend(excel_rows)
+            for rows in modora_rows:
+                all_rows.extend(rows)
+            all_rows = _dedupe_entity_rows(all_rows)
     logger.info(
         "table[%d] parent rows: excel=%d total=%d",
         tidx, len(excel_rows), len(all_rows),
@@ -1004,8 +1254,14 @@ async def _fill_one_table(
 
     # -------- 6.5. route channel files (G2, for MoDora fallback) --------
     md_txt_routed, word_routed = await asyncio.gather(
-        _route_channel_files(md_txt_docs, parent_headers, child_headers, all_rows, requirement),
-        _route_channel_files(word_docs,   parent_headers, child_headers, all_rows, requirement),
+        _route_channel_files(
+            md_txt_docs, parent_headers, child_headers, all_rows, requirement,
+            text_cache=text_cache,
+        ),
+        _route_channel_files(
+            word_docs, parent_headers, child_headers, all_rows, requirement,
+            text_cache=text_cache,
+        ),
     )
     logger.info(
         "table[%d] after routing: md_txt=%d word=%d",
@@ -1080,6 +1336,7 @@ async def _fill_one_table(
             [headers[c] for c in cols_needing],
             parent_headers, query_rows,
             md_txt_paths, word_paths, requirement, context,
+            text_cache=text_cache,
         )
         for col in cols_needing:
             h = headers[col]
@@ -1115,11 +1372,33 @@ async def _fill_one_table(
         )
         md_txt_modora_fns = [d.modora_filename for d in md_txt_routed if d.modora_filename]
         word_modora_fns   = [d.modora_filename for d in word_routed   if d.modora_filename]
-        modora_channels: Dict[str, List[str]] = {
-            "md_txt": md_txt_modora_fns,
-            "word":   word_modora_fns,
-        }
-        modora_child_fill = await _dispatch_questions(questions, modora_channels, requirement)
+        # Skip unhealthy channels entirely. ``channel_health.get(c, True)``
+        # defaults to healthy so callers that don't pass a probe result (e.g.
+        # tests, Excel-only runs) keep the previous behaviour.
+        health = channel_health or {}
+        modora_channels: Dict[str, List[str]] = {}
+        if md_txt_modora_fns and health.get("md_txt", True):
+            modora_channels["md_txt"] = md_txt_modora_fns
+        if word_modora_fns and health.get("word", True):
+            modora_channels["word"] = word_modora_fns
+        skipped = [
+            c for c in ("md_txt", "word")
+            if health.get(c, True) is False
+        ]
+        if skipped:
+            logger.warning(
+                "table[%d] skipping unhealthy channel(s): %s — %d residual "
+                "questions will be unanswered by those channels",
+                tidx, skipped, len(questions),
+            )
+        if modora_channels:
+            modora_child_fill = await _dispatch_questions(questions, modora_channels, requirement)
+        else:
+            logger.warning(
+                "table[%d] no healthy MoDora channels available — all %d "
+                "residual questions will be left blank",
+                tidx, len(questions),
+            )
 
     # Merge: Excel > batch LLM > MoDora (priority order).
     child_fill: Dict[str, str] = {}
@@ -1180,6 +1459,28 @@ async def process(
         len(excel_paths), len(md_txt_docs), len(word_docs),
     )
 
+    # -------- 2.5. probe MoDora channels so we don't hang on dead peers --------
+    # Only probe channels that actually have ingested files; no point failing
+    # over a channel we weren't going to call anyway. Excel is in-process so
+    # it's always "healthy" by definition.
+    channels_to_probe: List[str] = []
+    if md_txt_docs:
+        channels_to_probe.append("md_txt")
+    if word_docs:
+        channels_to_probe.append("word")
+    if channels_to_probe:
+        channel_health = await backend_client.probe_channels(channels_to_probe)
+        unhealthy = [c for c, ok in channel_health.items() if not ok]
+        if unhealthy:
+            logger.warning(
+                "unhealthy channels detected: %s — /chat fallback will skip them",
+                unhealthy,
+            )
+        else:
+            logger.info("channel probe: %s all healthy", channels_to_probe)
+    else:
+        channel_health = {}
+
     # -------- 3. parse template (multi-table aware) --------
     try:
         if kind == "word":
@@ -1197,6 +1498,23 @@ async def process(
     excel_sheets = excel_matcher.build_index(excel_paths)
     logger.info("excel_matcher indexed %d sheet(s)", len(excel_sheets))
 
+    # G9: pre-read every non-Excel doc once so every downstream prompt — parent
+    # extraction, routing briefs, batch child extraction — shares the same
+    # text buffer instead of hitting disk per call. For a typical TC2 run
+    # with 6 md/word docs this avoids 12+ redundant file reads per /process.
+    # Failures fall back to "" so downstream `if text:` checks still work.
+    text_cache: Dict[str, str] = {}
+    for p in md_txt_paths + word_paths:
+        try:
+            text_cache[p] = read_document_text(p) or ""
+        except Exception:
+            logger.warning("text_cache: failed to pre-read %s", p, exc_info=True)
+            text_cache[p] = ""
+    logger.info(
+        "text_cache: pre-read %d file(s), total %d chars",
+        len(text_cache), sum(len(v) for v in text_cache.values()),
+    )
+
     # -------- 4-9. fill each table independently (parallel when >1 table) --------
     async def _safe_fill(ti: table_ops.TemplateInfo) -> None:
         try:
@@ -1208,6 +1526,8 @@ async def process(
                 md_txt_paths=md_txt_paths,
                 word_paths=word_paths,
                 requirement=requirement,
+                channel_health=channel_health,
+                text_cache=text_cache,
             )
         except Exception:
             logger.exception("table[%d] fill failed — skipping", ti.table_index)

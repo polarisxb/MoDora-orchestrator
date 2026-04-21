@@ -25,6 +25,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -255,6 +256,57 @@ async def _call_one(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def _health_url(chat_url: str) -> str:
+    """Derive the /health endpoint from a /api/chat URL on the same host.
+
+    ``http://127.0.0.1:8005/api/chat`` -> ``http://127.0.0.1:8005/health``
+
+    We keep this separate from ``CHANNEL_URLS`` because the /chat path is
+    controller-owned but /health is app-wide (mounted directly on FastAPI).
+    """
+    parsed = urlparse(chat_url)
+    return urlunparse((parsed.scheme, parsed.netloc, "/health", "", "", ""))
+
+
+_DEFAULT_PROBE_CHANNELS = ("md_txt", "word")
+
+
+async def probe_channels(
+    channels: Optional[List[str]] = None,
+    *,
+    timeout: float = 2.0,
+) -> Dict[str, bool]:
+    """Return ``{channel: True/False}`` based on /health reachability.
+
+    A channel is considered healthy iff its /health endpoint returns HTTP 200
+    within ``timeout`` seconds. Any network error, non-200 status, or timeout
+    classifies it as unhealthy — callers should drop unhealthy channels from
+    ``files_by_channel`` so they never get a 60s /chat timeout per question.
+
+    The default 2-second timeout is intentionally aggressive: if the process
+    is alive, /health responds in < 50 ms. If it takes > 2 s, something is
+    already broken and we shouldn't wait for each individual /chat to find
+    that out the slow way.
+    """
+    targets = list(channels) if channels else list(_DEFAULT_PROBE_CHANNELS)
+
+    async def _one(channel: str) -> tuple:
+        url = CHANNEL_URLS.get(channel)
+        if not url:
+            return channel, False
+        health = _health_url(url)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                resp = await client.get(health)
+                return channel, resp.status_code == 200
+        except httpx.HTTPError as e:
+            logger.warning("probe %s (%s) failed: %s", channel, health, e)
+            return channel, False
+
+    results = await asyncio.gather(*[_one(c) for c in targets])
+    return dict(results)
+
 
 async def dispatch(
     question: str,

@@ -26,6 +26,7 @@ comparable key.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -168,50 +169,125 @@ def apply_row_filters(
 # Loading
 # ---------------------------------------------------------------------------
 
+def _load_xlsx_sheets(path: str) -> List[SheetIndex]:
+    """Load every sheet of a .xlsx file via openpyxl."""
+    import openpyxl
+
+    out: List[SheetIndex] = []
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
+    except Exception:
+        logger.exception("excel_matcher: failed to open %s", path)
+        return out
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                first = next(rows_iter)
+            except StopIteration:
+                continue
+            raw_headers = ["" if v is None else str(v).strip() for v in first]
+            headers = [_norm(h) for h in raw_headers]
+            rows: List[List[str]] = []
+            for row in rows_iter:
+                row_vals = ["" if v is None else str(v).strip() for v in row]
+                if any(row_vals):
+                    rows.append(row_vals)
+            out.append(SheetIndex(
+                source_path=path,
+                sheet_name=sheet_name,
+                raw_headers=raw_headers,
+                headers=headers,
+                rows=rows,
+            ))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return out
+
+
+def _load_xls_sheets(path: str) -> List[SheetIndex]:
+    """Load every sheet of a legacy .xls file via xlrd.
+
+    xlrd is imported lazily: if it's not installed the file is simply
+    skipped with a warning so the orchestrator still works for .xlsx-only
+    workloads. Install ``xlrd<2.0`` (2.x dropped .xlsx but kept .xls) if
+    you need this channel.
+    """
+    try:
+        import xlrd  # type: ignore
+    except ImportError:
+        logger.warning(
+            "excel_matcher: skipping %s (.xls) because xlrd is not installed; "
+            "run `pip install xlrd<2.0` if you need legacy Excel support",
+            path,
+        )
+        return []
+
+    out: List[SheetIndex] = []
+    try:
+        book = xlrd.open_workbook(path)
+    except Exception:
+        logger.exception("excel_matcher: failed to open %s", path)
+        return out
+    try:
+        for sheet_index in range(book.nsheets):
+            ws = book.sheet_by_index(sheet_index)
+            sheet_name = ws.name
+            if ws.nrows == 0:
+                continue
+            first = ws.row_values(0)
+            raw_headers = ["" if v is None else str(v).strip() for v in first]
+            headers = [_norm(h) for h in raw_headers]
+            rows: List[List[str]] = []
+            for r in range(1, ws.nrows):
+                row_vals = [
+                    "" if v is None else str(v).strip()
+                    for v in ws.row_values(r)
+                ]
+                if any(row_vals):
+                    rows.append(row_vals)
+            out.append(SheetIndex(
+                source_path=path,
+                sheet_name=sheet_name,
+                raw_headers=raw_headers,
+                headers=headers,
+                rows=rows,
+            ))
+    finally:
+        try:
+            book.release_resources()
+        except Exception:
+            pass
+    return out
+
+
 def build_index(excel_paths: List[str]) -> List[SheetIndex]:
     """Load headers + rows for every sheet in every Excel path.
 
     Returns an empty list if ``excel_paths`` is empty. Failing workbooks are
-    logged and skipped; one bad file does not poison the rest.
+    logged and skipped; one bad file does not poison the rest. Supports
+    both modern ``.xlsx`` (via openpyxl) and legacy ``.xls`` (via xlrd, if
+    installed).
     """
     if not excel_paths:
         return []
-    import openpyxl
 
     out: List[SheetIndex] = []
     for path in excel_paths:
-        try:
-            wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
-        except Exception:
-            logger.exception("excel_matcher: failed to open %s", path)
-            continue
-        try:
-            for sheet_name in wb.sheetnames:
-                ws = wb[sheet_name]
-                rows_iter = ws.iter_rows(values_only=True)
-                try:
-                    first = next(rows_iter)
-                except StopIteration:
-                    continue
-                raw_headers = ["" if v is None else str(v).strip() for v in first]
-                headers = [_norm(h) for h in raw_headers]
-                rows: List[List[str]] = []
-                for row in rows_iter:
-                    row_vals = ["" if v is None else str(v).strip() for v in row]
-                    if any(row_vals):
-                        rows.append(row_vals)
-                out.append(SheetIndex(
-                    source_path=path,
-                    sheet_name=sheet_name,
-                    raw_headers=raw_headers,
-                    headers=headers,
-                    rows=rows,
-                ))
-        finally:
-            try:
-                wb.close()
-            except Exception:
-                pass
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".xlsx":
+            out.extend(_load_xlsx_sheets(path))
+        elif ext == ".xls":
+            out.extend(_load_xls_sheets(path))
+        else:
+            logger.warning(
+                "excel_matcher: skipping %s (unsupported extension %s)",
+                path, ext,
+            )
     logger.info("excel_matcher: indexed %d sheet(s) from %d file(s)",
                 len(out), len(excel_paths))
     return out

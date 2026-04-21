@@ -38,6 +38,28 @@ _LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 _LLM_BACKOFF_BASE = float(os.environ.get("LLM_BACKOFF_BASE", "1.5"))
 _LLM_BACKOFF_CAP = float(os.environ.get("LLM_BACKOFF_CAP", "10"))
 
+# Global LLM concurrency gate. DashScope will happily 429 us if the whole
+# /process pipeline tries to push 10+ LLM calls simultaneously (structure
+# detection + Excel filter + parent extraction × 2 + routing × 2 + batch
+# children + arbitrations + extract/edit endpoints). A process-wide semaphore
+# is a cleaner lever than tuning ORCH_QUESTION_CONCURRENCY downstream because
+# it covers ALL call sites, not just the /chat dispatch.
+_LLM_CONCURRENCY = int(os.environ.get("ORCH_LLM_CONCURRENCY", "6"))
+_LLM_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-init so the semaphore is bound to the running event loop.
+
+    Creating ``asyncio.Semaphore`` at import time works on 3.10+ but can
+    cause weird behaviour when multiple tests spin up fresh loops; lazy
+    init keeps us safe on any runner.
+    """
+    global _LLM_SEMAPHORE
+    if _LLM_SEMAPHORE is None:
+        _LLM_SEMAPHORE = asyncio.Semaphore(max(1, _LLM_CONCURRENCY))
+    return _LLM_SEMAPHORE
+
 # HTTP statuses that warrant a retry. Everything else (400 / 401 / 404) is a
 # client bug and retrying only masks it.
 _RETRIABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
@@ -134,47 +156,53 @@ async def chat(
         payload["temperature"] = temperature
 
     last_detail = "unknown"
-    for attempt in range(attempts):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    LLM_API_URL,
-                    headers={"Authorization": f"Bearer {_get_api_key()}"},
-                    json=payload,
-                )
-        except httpx.HTTPError as e:
-            last_detail = f"network: {e}"
-            if attempt + 1 >= attempts:
-                raise LLMError(f"LLM network error after {attempts} attempts: {e}") from e
-            delay = _compute_backoff(attempt, None)
-            logger.warning(
-                "llm.chat network error (attempt %d/%d, model=%s): %s — retrying in %.1fs",
-                attempt + 1, attempts, model, e, delay,
-            )
-            await asyncio.sleep(delay)
-            continue
-
-        if resp.status_code == 200:
+    # Hold the semaphore for the whole retry loop, not just each individual
+    # HTTP post. Rationale: if we released the slot during the backoff sleep,
+    # a fresh chat() caller could grab it and push DashScope right back into
+    # 429 territory while we were trying to cool down. Keeping the slot
+    # throttles the *effective* rate, not just the instantaneous one.
+    async with _get_semaphore():
+        for attempt in range(attempts):
             try:
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, ValueError) as e:
-                raise LLMError(
-                    f"LLM unexpected response: {e}; body={resp.text[:400]}"
-                ) from e
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        LLM_API_URL,
+                        headers={"Authorization": f"Bearer {_get_api_key()}"},
+                        json=payload,
+                    )
+            except httpx.HTTPError as e:
+                last_detail = f"network: {e}"
+                if attempt + 1 >= attempts:
+                    raise LLMError(f"LLM network error after {attempts} attempts: {e}") from e
+                delay = _compute_backoff(attempt, None)
+                logger.warning(
+                    "llm.chat network error (attempt %d/%d, model=%s): %s — retrying in %.1fs",
+                    attempt + 1, attempts, model, e, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-        last_detail = f"http{resp.status_code}: {resp.text[:200]}"
-        if resp.status_code in _RETRIABLE_HTTP and attempt + 1 < attempts:
-            delay = _compute_backoff(attempt, resp.headers.get("Retry-After"))
-            logger.warning(
-                "llm.chat http %d (attempt %d/%d, model=%s) — retrying in %.1fs",
-                resp.status_code, attempt + 1, attempts, model, delay,
-            )
-            await asyncio.sleep(delay)
-            continue
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, ValueError) as e:
+                    raise LLMError(
+                        f"LLM unexpected response: {e}; body={resp.text[:400]}"
+                    ) from e
 
-        # Non-retriable HTTP or retries exhausted: surface immediately.
-        raise LLMError(f"LLM http {resp.status_code}: {resp.text[:400]}")
+            last_detail = f"http{resp.status_code}: {resp.text[:200]}"
+            if resp.status_code in _RETRIABLE_HTTP and attempt + 1 < attempts:
+                delay = _compute_backoff(attempt, resp.headers.get("Retry-After"))
+                logger.warning(
+                    "llm.chat http %d (attempt %d/%d, model=%s) — retrying in %.1fs",
+                    resp.status_code, attempt + 1, attempts, model, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # Non-retriable HTTP or retries exhausted: surface immediately.
+            raise LLMError(f"LLM http {resp.status_code}: {resp.text[:400]}")
 
     # Should be unreachable — loop either returns or raises — but keeps the
     # type checker happy.
@@ -206,19 +234,23 @@ def build_structure_prompt(
         + f"【表格上下文】: {context or '(无)'}\n"
         + f"【表头(从左到右)】: {headers}\n\n"
         "判断每一列的角色:\n"
-        "  - 父列 (parent):用来唯一标识实体的维度,如城市 / 区 / 站点名 / 公司名 / 排名。\n"
-        "  - 子列 (child):待查询的数值或属性指标,如 GDP / 人口 / AQI / 收入、类别、分类、部门、负责人、时间。\n"
+        "  - 父列 (parent):用来唯一标识实体的维度,如城市 / 区 / 站点名 / 公司名 / 排名 / 日期 / 站点编码。\n"
+        "  - 子列 (child):待查询的数值或属性指标,如 GDP / 人口 / AQI / 收入、类别、分类、部门、负责人。\n"
         "规则:\n"
         "  1. 父列通常在左侧,子列通常在右侧,但不绝对。\n"
         "  2. **父列必须是唯一标识符**,不能由其他列推导得出。\n"
         "     - 若单列已能唯一标识实体(如产品名称、股票代码、员工姓名、身份证号),则仅该列为父列。\n"
-        "     - 只有当单列不足以唯一标识(如行政区需要 '省'+'市'+'区')时,才把多列合并为父列。\n"
+        "     - 只有当单列不足以唯一标识(如行政区需要 '省'+'市'+'区',或时间序列需要 '日期'+'城市')时,才把多列合并为父列。\n"
         "  3. 描述性 / 从属性的列(如 '类别' 跟随 '产品名称','部门' 跟随 '员工')一律归为子列——\n"
         "     这些列在文档中是参考,而不是查询键。\n"
-        "  4. 所有列索引从 0 开始。\n\n"
+        "  4. 纯数值 / 度量指标(GDP、人口、面积、产量、售价、AQI、PM2.5、降雨量、温度)几乎都是子列。\n"
+        "  5. 所有列索引从 0 开始。\n\n"
         "严格只返回 JSON,禁止任何解释、禁止 Markdown 代码块。\n"
         '示例 1: 表头 ["产品名称","类别","售价","上线时间"] -> {"parent_columns": [0], "child_columns": [1, 2, 3]}\n'
         '示例 2: 表头 ["省","市","GDP","人口"]           -> {"parent_columns": [0, 1], "child_columns": [2, 3]}\n'
+        '示例 3: 表头 ["日期","国家","确诊数","治愈数"]   -> {"parent_columns": [0, 1], "child_columns": [2, 3]}\n'
+        '示例 4: 表头 ["站点编码","PM2.5","AQI","监测时间"] -> {"parent_columns": [0, 3], "child_columns": [1, 2]}\n'
+        '示例 5: 表头 ["排名","城市","GDP","人口"]       -> {"parent_columns": [1], "child_columns": [0, 2, 3]}\n'
     )
 
 
