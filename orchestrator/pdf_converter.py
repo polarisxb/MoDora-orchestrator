@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-_CONVERT_TIMEOUT_DEFAULT = float(os.environ.get("LIBREOFFICE_TIMEOUT", "60"))
+_CONVERT_TIMEOUT_DEFAULT = float(os.environ.get("LIBREOFFICE_TIMEOUT", "120"))
 
 # Extensions this module knows how to convert. PDFs pass through unchanged
 # so callers can treat every input uniformly.
